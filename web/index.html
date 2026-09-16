@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>权限感知型私有科研知识库问答系统</title>
+<style>
+  :root { --brand:#1f6f5c; --bg:#f4f6f5; --card:#fff; --line:#dfe5e3; --muted:#6b7a76; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+         background:var(--bg); color:#1d2b27; }
+  header { background:var(--brand); color:#fff; padding:14px 24px; display:flex;
+           justify-content:space-between; align-items:center; }
+  header h1 { font-size:18px; margin:0; font-weight:600; }
+  main { max-width:1080px; margin:20px auto; padding:0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          padding:18px 20px; margin-bottom:18px; }
+  .card h2 { font-size:15px; margin:0 0 14px; color:var(--brand); }
+  label { font-size:13px; color:var(--muted); display:block; margin:8px 0 4px; }
+  input,select,textarea,button { font:inherit; }
+  input[type=text],input[type=email],input[type=password],select,textarea {
+    width:100%; padding:9px 11px; border:1px solid var(--line); border-radius:7px; background:#fbfdfc; }
+  textarea { resize:vertical; }
+  button { background:var(--brand); color:#fff; border:0; border-radius:7px;
+           padding:9px 18px; cursor:pointer; font-weight:600; }
+  button.ghost { background:#eef3f1; color:var(--brand); }
+  button.danger { background:#c0473b; }
+  button.small { padding:4px 10px; font-size:12px; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; }
+  .row > div { flex:1; min-width:140px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; background:#f8faf9; }
+  .tag { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px;
+         background:#e7f0ed; color:var(--brand); }
+  .tag.private{background:#f3e9e7;color:#a34a3c;}
+  .tag.team{background:#e8eff6;color:#2c5d8f;}
+  .tag.department{background:#f2edf6;color:#6b4a8f;}
+  .tag.public{background:#e9f3e7;color:#3c7a3c;}
+  .muted { color:var(--muted); font-size:12px; }
+  .src { border-left:3px solid var(--brand); background:#f6faf9; padding:9px 12px;
+         border-radius:0 7px 7px 0; margin:8px 0; font-size:13px; }
+  .answer { line-height:1.75; font-size:15px; white-space:pre-wrap; }
+  .hidden { display:none; }
+  #who { font-size:12px; opacity:.9; text-align:right; }
+  .score { color:var(--muted); font-size:11px; }
+  .exact { background:#fff3bf; padding:0 2px; border-radius:3px; }
+  code { background:#f0f3f2; padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔬 权限感知型私有科研知识库问答系统</h1>
+  <div id="who"></div>
+</header>
+<main>
+
+  <!-- 登录 -->
+  <section class="card" id="loginCard">
+    <h2>登录（选择租户上下文）</h2>
+    <div class="row">
+      <div><label>邮箱</label><input type="email" id="email" value="alice@lab.cn"></div>
+      <div><label>密码</label><input type="password" id="password" value="demo123"></div>
+      <div><label>租户</label><select id="tenant"></select></div>
+    </div>
+    <p class="muted">演示账号：alice@lab.cn / bob@lab.cn / carol@lab.cn / dave@lab.cn（租户 biolab），
+      erin@chem.cn（租户 chemmat），密码均为 <code>demo123</code></p>
+    <button onclick="login()">登录</button>
+  </section>
+
+  <div id="app" class="hidden">
+    <!-- 问答 -->
+    <section class="card">
+      <h2>① 单轮问答（仅检索您有权访问的片段）</h2>
+      <textarea id="question" rows="2" placeholder="例如：LPN-207 的包封率是多少？"></textarea>
+      <div style="margin-top:10px"><button onclick="ask()">提问</button>
+        <button class="ghost" onclick="doSearch()">仅检索</button></div>
+      <div id="qaResult"></div>
+    </section>
+
+    <!-- 检索结果 -->
+    <section class="card" id="searchCard" style="display:none">
+      <h2>检索命中片段（已做权限穿透过滤）</h2>
+      <div id="searchResult"></div>
+    </section>
+
+    <!-- 上传 -->
+    <section class="card">
+      <h2>② 文档入库（PDF / Word / TXT / MD / 实验日志）</h2>
+      <div class="row">
+        <div><label>文件</label><input type="file" id="file"></div>
+        <div><label>标题（可选）</label><input type="text" id="title"></div>
+        <div><label>可见性</label>
+          <select id="visibility">
+            <option value="private">私有（仅所有者）</option>
+            <option value="team">团队公开</option>
+            <option value="department">部门公开</option>
+            <option value="public">租户公开</option>
+          </select></div>
+        <div><label>归属团队</label><input type="text" id="ownerTeam" placeholder="留空取本人团队"></div>
+        <div><label>归属部门</label><input type="text" id="ownerDept" placeholder="留空取本人部门"></div>
+      </div>
+      <div style="margin-top:10px"><button onclick="upload()">上传并自动分段</button></div>
+      <div id="uploadResult" class="muted"></div>
+    </section>
+
+    <!-- 文档列表与片段权限 -->
+    <section class="card">
+      <h2>③ 文档与片段权限管理</h2>
+      <div style="margin-bottom:10px"><button class="ghost small" onclick="loadDocs()">刷新列表</button></div>
+      <table id="docTable">
+        <thead><tr><th>标题</th><th>类型</th><th>片段</th><th>可见性</th><th>操作</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div id="chunkPanel"></div>
+    </section>
+  </div>
+</main>
+
+<script>
+let TOKEN = null, ME = null;
+
+async function api(method, path, body, isForm) {
+  const opt = { method, headers: {} };
+  if (TOKEN) opt.headers["Authorization"] = "Bearer " + TOKEN;
+  if (body !== undefined) {
+    if (isForm) { opt.body = body; }
+    else { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
+  }
+  const r = await fetch(path, opt);
+  return { status: r.status, data: await r.json().catch(() => ({})) };
+}
+
+async function loadTenants() {
+  const r = await fetch("/api/tenants");
+  const list = await r.json();
+  const sel = document.getElementById("tenant");
+  sel.innerHTML = list.map(t => `<option value="${t.slug}">${t.name}（${t.slug}）</option>`).join("");
+  if (!list.find(t => t.slug === "biolab")) sel.value = list[0]?.slug;
+}
+
+async function login() {
+  const payload = { email: email.value.trim(), password: password.value,
+                    tenant_slug: tenant.value };
+  const r = await fetch("/api/auth/login", { method:"POST",
+    headers:{"Content-Type":"application/json"}, body: JSON.stringify(payload) });
+  const d = await r.json();
+  if (!r.ok) { alert("登录失败：" + d.error); return; }
+  TOKEN = d.token;
+  const me = await api("GET", "/api/me");
+  ME = me.data;
+  document.getElementById("loginCard").classList.add("hidden");
+  document.getElementById("app").classList.remove("hidden");
+  document.getElementById("who").innerHTML =
+    `${ME.user.display_name}（${ME.user.email}）<br>租户：${ME.tenant.name} · 角色：${ME.tenant.role}` +
+    (ME.team ? `<br>${ME.department||""} / ${ME.team}` : "") +
+    ` <a href="#" onclick="logout();return false;" style="color:#fff;text-decoration:underline">退出</a>`;
+  loadDocs();
+}
+
+async function logout() { location.reload(); }
+
+const visTag = v => {
+  const map = { private:"私有", team:"团队公开", department:"部门公开", public:"租户公开" };
+  const key = (v||"").startsWith("inherit") ? v.slice(8,-1) : v;
+  return `<span class="tag ${key}">${v.startsWith("inherit") ? "继承:"+map[key] : (map[v]||v)}</span>`;
+};
+
+async function upload() {
+  const f = document.getElementById("file").files[0];
+  if (!f) { alert("请选择文件"); return; }
+  const fd = new FormData();
+  fd.append("file", f);
+  fd.append("visibility", document.getElementById("visibility").value);
+  if (title.value) fd.append("title", title.value);
+  if (ownerTeam.value) fd.append("owner_team", ownerTeam.value);
+  if (ownerDept.value) fd.append("owner_dept", ownerDept.value);
+  const r = await api("POST", "/api/documents", fd, true);
+  const box = document.getElementById("uploadResult");
+  if (r.status !== 200) { box.innerHTML = "❌ " + r.data.error; return; }
+  box.innerHTML = `✅ 已入库《${r.data.title}》，正文 ${r.data.char_count} 字，` +
+    `语义分段 <b>${r.data.chunk_count}</b> 个：<br>` +
+    r.data.chunks_preview.map(c =>
+      `片段#${c.index} ${c.heading_path ? "["+c.heading_path+"]" : ""} ${c.chars}字 ` +
+      `${c.page_start ? "p."+c.page_start : ""}`).join("<br>");
+  loadDocs();
+}
+
+async function loadDocs() {
+  const r = await api("GET", "/api/documents");
+  const tb = document.querySelector("#docTable tbody");
+  tb.innerHTML = r.data.map(d => `<tr>
+    <td>${d.title}<div class="muted">${d.source_name}</div></td>
+    <td>${d.file_type}</td><td>${d.chunk_count}</td>
+    <td>${visTag(d.visibility)}<div class="muted">${d.owner_team||""}${d.owner_dept?" / "+d.owner_dept:""}</div></td>
+    <td>
+      <button class="small ghost" onclick="viewChunks(${d.id})">片段/授权</button>
+      <button class="small danger" onclick="delDoc(${d.id})">删除</button>
+    </td></tr>`).join("") || `<tr><td colspan="5" class="muted">暂无可访问文档</td></tr>`;
+}
+
+async function delDoc(id) {
+  if (!confirm("确认删除该文档及其所有片段？")) return;
+  const r = await api("DELETE", `/api/documents/${id}`);
+  alert(r.data.error || r.data.message);
+  loadDocs();
+}
+
+async function viewChunks(docId) {
+  const r = await api("GET", `/api/documents/${docId}/chunks`);
+  const panel = document.getElementById("chunkPanel");
+  if (r.status !== 200) { panel.innerHTML = "❌ " + r.data.error; return; }
+  panel.innerHTML = "<h2>片段列表（可单独绑定可见性 / 指定用户·角色·团队·部门）</h2>" +
+    r.data.map(c => `<div class="src">
+      <b>#${c.chunk_index+1}</b> ${c.heading_path ? "【"+c.heading_path+"】" : ""}
+      ${visTag(c.visibility)} <span class="score">${c.page_start ? "p."+c.page_start+" · " : ""}
+      字符[${c.char_start},${c.char_end}) · id=${c.chunk_id}</span>
+      <div>${escapeHtml(c.content)}…</div>
+      <div style="margin-top:6px">
+        <select id="vis_${c.chunk_id}">
+          <option value="">继承文档</option>
+          <option value="private">私有</option><option value="team">团队</option>
+          <option value="department">部门</option><option value="public">租户公开</option>
+        </select>
+        <button class="small" onclick="setVis(${c.chunk_id})">保存可见性</button>
+        <select id="gt_${c.chunk_id}">
+          <option value="user">指定用户</option><option value="role">指定角色</option>
+          <option value="team">指定团队</option><option value="department">指定部门</option>
+        </select>
+        <input type="text" id="gv_${c.chunk_id}" placeholder="用户ID / 角色名 / 团队名 / 部门名"
+               style="width:260px;display:inline-block">
+        <button class="small ghost" onclick="addGrant(${c.chunk_id})">添加授权</button>
+        <button class="small ghost" onclick="viewSource(${c.document_id},${c.chunk_id})">查看溯源原文</button>
+      </div>
+      <div class="muted" id="grants_${c.chunk_id}">${(c.grants||[]).map(g =>
+        `<span class="tag">${g.subject_type}:${g.subject_value}
+        <a href="#" onclick="rmGrant(${c.chunk_id},${g.id});return false;" style="color:#a34a3c">✕</a></span> `).join("")}</div>
+    </div>`).join("");
+  panel.scrollIntoView({behavior:"smooth"});
+}
+
+async function setVis(cid) {
+  const v = document.getElementById("vis_"+cid).value || null;
+  const r = await api("PUT", `/api/chunks/${cid}/visibility`, { visibility: v });
+  alert(r.data.error || r.data.message);
+  loadDocs();
+}
+async function addGrant(cid) {
+  const t = document.getElementById("gt_"+cid).value;
+  const v = document.getElementById("gv_"+cid).value.trim();
+  if (!v) { alert("请填写授权对象"); return; }
+  const r = await api("POST", `/api/chunks/${cid}/grants`, { subject_type:t, subject_value:v });
+  alert(r.data.error || "授权成功");
+  loadDocs();
+}
+async function rmGrant(cid, gid) {
+  const r = await api("DELETE", `/api/chunks/${cid}/grants/${gid}`);
+  if (r.data.error) alert(r.data.error);
+  // 重新展开当前文档
+  const docId = document.querySelector("#chunkPanel .src")?.id;
+}
+async function viewSource(docId, cid) {
+  const r = await api("GET", `/api/documents/${docId}/chunks/${cid}/source`);
+  if (r.status !== 200) { alert(r.data.error); return; }
+  const s = r.data;
+  alert(`《${s.title}》 ${s.heading_path ? "["+s.heading_path+"] " : ""}` +
+        `${s.page_start ? "第"+s.page_start+"页 " : ""}字符[${s.char_range[0]},${s.char_range[1]})\n\n` +
+        (s.before ? "…"+s.before : "") + "\n【" + s.exact_text + "】\n" + (s.after ? s.after+"…" : ""));
+}
+
+async function ask() {
+  const q = document.getElementById("question").value.trim();
+  if (!q) return;
+  const r = await api("POST", "/api/ask", { question:q });
+  const box = document.getElementById("qaResult");
+  if (r.status !== 200) { box.innerHTML = "❌ " + r.data.error; return; }
+  box.innerHTML = `<div class="answer">${escapeHtml(r.data.answer)}</div>
+    <p class="muted">回答模式：${r.data.mode==="llm" ? "LLM 生成" : "内置抽取式（离线）"} · 来源 ${r.data.sources.length} 条</p>` +
+    r.data.sources.map(srcHtml).join("");
+}
+async function doSearch() {
+  const q = document.getElementById("question").value.trim();
+  if (!q) return;
+  const r = await api("POST", "/api/search", { query:q });
+  document.getElementById("searchCard").style.display = "block";
+  document.getElementById("searchResult").innerHTML =
+    `命中 <b>${r.data.count}</b> 个您有权访问的片段：` +
+    r.data.results.map(x => `<div class="src">${srcMini(x)}</div>`).join("");
+}
+const srcMini = x => `<b>《${x.title}》</b> ${x.heading_path ? "【"+x.heading_path+"】" : ""}
+  <span class="score">#${x.chunk_index+1} ${x.page_start?"p."+x.page_start:""} score=${x.score}</span><br>${escapeHtml(x.content)}`;
+const srcHtml = s => `<div class="src">📄 <b>《${s.document_title}》</b>
+  ${s.section ? "【"+s.section+"】" : ""} <span class="score">片段#${s.chunk_index} ·
+  ${s.location} · 字符[${s.char_range[0]},${s.char_range[1]}) · BM25=${s.score}</span></div>`;
+const escapeHtml = s => (s||"").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+
+loadTenants();
+</script>
+</body>
+</html>
