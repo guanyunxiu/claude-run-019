@@ -98,6 +98,22 @@ def can_manage_document(ctx: dict, doc) -> bool:
     return user_can_manage(ctx) or doc["owner_user_id"] == ctx["user_id"]
 
 
+def can_read_document(conn, ctx: dict, doc) -> bool:
+    """是否可读某文档（含其至少一个被授权片段）。
+
+    与管理权不同：同团队/同部门/被片段授权的成员可读文档与可见片段，
+    但不能修改权限或删除。
+    """
+    if doc is None or doc["tenant_id"] != ctx["tenant_id"]:
+        return False
+    where, params = accessible_document_where(ctx)
+    row = conn.execute(
+        f"SELECT 1 AS ok FROM documents d WHERE d.id=? AND {where}",
+        [doc["id"]] + params,
+    ).fetchone()
+    return row is not None
+
+
 def can_manage_chunk(ctx: dict, conn, chunk_row) -> bool:
     """修改片段权限需要：租户管理员，或该片段所属文档的所有者。"""
     if user_can_manage(ctx):

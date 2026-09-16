@@ -72,6 +72,8 @@ python3 tests/test_api.py
 - 片段级：`chunks.visibility` 可**单独覆盖**文档可见性（`NULL` = 继承文档）。
 - 片段附加授权 `chunk_grants`：向**指定用户 / 指定角色 / 指定团队 / 指定部门**放行单个片段。
 - 管理权限：租户管理员可管理本租户全部内容；文档所有者可管理其文档与片段。
+- **读权限与管理权分离**：同团队/同部门/被片段授权的成员可查看文档详情、片段与溯源原文，
+  但不能改可见性、加授权或删除（`can_read_document` vs `can_manage_document`）。
 - 接口：`PUT /api/chunks/{id}/visibility`、`POST /api/chunks/{id}/grants`、
   `DELETE /api/chunks/{id}/grants/{gid}`。
 
@@ -88,6 +90,8 @@ python3 tests/test_api.py
 1. **独立库文件**：每个租户一个 SQLite（`data/tenants/<slug>.db`），schema 中再带 `tenant_id` 闸门；
 2. **独立文件目录**：原文存 `data/blobs/<slug>/`；
 3. **租户身份来自服务端令牌**：API 从不接受客户端自报租户，slug 做白名单字符校验防路径穿越；
+   令牌校验对成员关系使用 **INNER JOIN**——用户被移出租户后，其未过期的旧 Bearer 令牌也会
+   **立即失效**（同步删除该租户下其全部会话），无法再鉴权或写入租户库；
 4. **每请求只打开所属租户连接**，应用层不存在跨租户 JOIN/查询的代码路径；
 5. 全局库仅存租户/账号/令牌，**不含任何业务数据**。
 
@@ -111,8 +115,9 @@ python3 tests/test_api.py
 | GET `/api/tenants` | 租户列表（供选择登录上下文） | 公开 |
 | POST `/api/admin/tenants` | 创建租户 | 平台管理员 |
 | GET/POST `/api/admin/members` | 租户成员管理 | 租户管理员 |
-| POST `/api/documents` | 上传（multipart：file/title/visibility/owner_team/owner_dept） | 登录 |
-| GET `/api/documents` · `/{id}` · DELETE `/{id}` | 文档（列表已按权限过滤） | 登录 |
+| DELETE `/api/admin/members/{user_id}` | 移出租户（**立即删除该租户下其全部会话**，旧令牌即时失效） | 租户管理员 |
+| POST `/api/documents` | 上传（multipart：file/title/visibility/owner_team/owner_dept） | 登录（须为本租户成员） |
+| GET `/api/documents` · `/{id}` · DELETE `/{id}` | 列表/详情按**读权限** ACL 过滤；删除需管理权 | 登录 |
 | GET `/api/documents/{id}/chunks` | 片段+授权（管理者看全量，成员只看可见） | 登录 |
 | GET `/api/documents/{id}/chunks/{cid}/source` | 片段溯源原文定位 | 登录（受权） |
 | PUT `/api/chunks/{cid}/visibility` | 设置片段可见性（null=继承） | 所有者/管理员 |

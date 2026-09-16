@@ -127,6 +127,22 @@ def get_membership(conn, tenant_id: int, user_id: int) -> Optional[sqlite3.Row]:
     ).fetchone()
 
 
+def remove_tenant_member(conn, tenant_id: int, user_id: int) -> bool:
+    """把用户移出租户，并立即吊销其在该租户上下文下的全部会话。
+
+    返回是否真的移除了成员关系。
+    """
+    cur = conn.execute(
+        "DELETE FROM tenant_users WHERE tenant_id=? AND user_id=?", (tenant_id, user_id)
+    )
+    removed = cur.rowcount > 0
+    # 吊销该用户在本租户的所有登录会话（旧 Bearer 令牌立刻失效）
+    conn.execute(
+        "DELETE FROM sessions WHERE tenant_id=? AND user_id=?", (tenant_id, user_id)
+    )
+    return removed
+
+
 def list_user_tenants(conn, user_id: int) -> list[sqlite3.Row]:
     return conn.execute(
         """SELECT t.*, tu.role FROM tenants t
@@ -162,7 +178,11 @@ def create_session(conn, user_id: int, tenant_id: int) -> str:
 
 
 def resolve_session(conn, token: str) -> Optional[dict]:
-    """校验令牌并返回登录上下文。过期令牌立即删除。"""
+    """校验令牌并返回登录上下文。过期令牌立即删除。
+
+    安全要点：与 tenant_users 使用 INNER JOIN——用户一旦被移出租户，其在该
+    租户上下文下的所有会话立即失效，旧 Bearer 令牌无法再鉴权或写入租户库。
+    """
     row = conn.execute(
         """SELECT s.token, s.user_id, s.tenant_id, s.expires_at,
                   u.email, u.display_name, u.is_platform_admin,
@@ -171,13 +191,21 @@ def resolve_session(conn, token: str) -> Optional[dict]:
            FROM sessions s
            JOIN users u   ON u.id = s.user_id
            JOIN tenants t ON t.id = s.tenant_id
-           LEFT JOIN tenant_users tu ON tu.tenant_id=s.tenant_id AND tu.user_id=s.user_id
+           JOIN tenant_users tu ON tu.tenant_id=s.tenant_id AND tu.user_id=s.user_id
            WHERE s.token=?""",
         (token,),
     ).fetchone()
     if row is None:
+        # 可能是过期，也可能是成员关系已不存在：顺手清理失效/孤儿会话
+        conn.execute("DELETE FROM sessions WHERE token=?", (token,))
+        conn.commit()
         return None
     if row["expires_at"] < time.time():
+        conn.execute("DELETE FROM sessions WHERE token=?", (token,))
+        conn.commit()
+        return None
+    # 双重保险：role 必须是有效值，否则按未授权处理
+    if not row["tenant_role"]:
         conn.execute("DELETE FROM sessions WHERE token=?", (token,))
         conn.commit()
         return None

@@ -5,7 +5,7 @@
           GET  /api/tenants（可浏览租户，用于选择登录上下文）
   认证后：GET  /api/me
   平台管理员：POST /api/admin/tenants
-  租户管理员：GET/POST /api/admin/members
+  租户管理员：GET/POST /api/admin/members，DELETE /api/admin/members/{user_id}（踢人并立即吊销令牌）
   文档：  POST /api/documents        GET /api/documents     GET /api/documents/{id}
           DELETE /api/documents/{id} GET /api/documents/{id}/chunks
           GET /api/documents/{id}/chunks/{cid}/source  （溯源原文定位）
@@ -37,6 +37,27 @@ class ApiError(Exception):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+def _parse_id(value: str, name: str = "id") -> int:
+    """路径参数转整数；非法（如 undefined / abc）返回 400，而不是抛 500。"""
+    try:
+        ivalue = int(value)
+        if ivalue <= 0:
+            raise ValueError
+        return ivalue
+    except (TypeError, ValueError):
+        raise ApiError(400, f"非法的 {name}: {value}")
+
+
+def _parse_topk(value) -> int:
+    try:
+        k = int(value)
+    except (TypeError, ValueError):
+        raise ApiError(400, "top_k 必须是正整数")
+    if not (1 <= k <= 50):
+        raise ApiError(400, "top_k 取值范围为 1-50")
+    return k
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -289,6 +310,20 @@ def add_member(h, ctx):
             "team": data.get("team"), "department": data.get("department")}
 
 
+@Handler.route("DELETE", "/api/admin/members/{user_id}")
+def remove_member(h, ctx, user_id):
+    """把用户移出租户：立即删除成员关系并吊销其在本租户的全部会话。"""
+    if ctx.user.get("tenant_role") != "admin":
+        raise ApiError(403, "仅租户管理员可管理成员")
+    target_id = _parse_id(user_id, "user_id")
+    if target_id == ctx.user["user_id"]:
+        raise ApiError(400, "不能移除当前登录的自己")
+    removed = db_global.remove_tenant_member(ctx.gconn, ctx.user["tenant_id"], target_id)
+    if not removed:
+        raise ApiError(404, "该用户不是当前租户成员")
+    return {"message": "成员已移除，其登录令牌已立即失效"}
+
+
 # ============================== 文档 ==============================
 
 @Handler.route("POST", "/api/documents")
@@ -331,18 +366,27 @@ def list_documents(h, ctx):
     return [dict(r) for r in rows]
 
 
-def _load_owned_doc(ctx, doc_id) -> dict:
+def _load_managed_doc(ctx, doc_id) -> dict:
+    """需要管理权限（删除等）的文档加载。"""
     doc = db_tenant.get_document(ctx.tconn, doc_id, ctx.user["tenant_id"])
     if doc is None:
         raise ApiError(404, "文档不存在或不属于当前租户")
     if not permissions.can_manage_document(ctx.identity, doc):
-        raise ApiError(403, "无权访问该文档")
+        raise ApiError(403, "无权管理该文档")
+    return doc
+
+
+def _load_readable_doc(ctx, doc_id) -> dict:
+    """需要读权限（详情/片段列表）的文档加载。同团队/同部门/被授权成员可读。"""
+    doc = db_tenant.get_document(ctx.tconn, doc_id, ctx.user["tenant_id"])
+    if doc is None or not permissions.can_read_document(ctx.tconn, ctx.identity, doc):
+        raise ApiError(404, "文档不存在或无权访问")
     return doc
 
 
 @Handler.route("GET", "/api/documents/{doc_id}")
 def get_document(h, ctx, doc_id):
-    doc = _load_owned_doc(ctx, int(doc_id))
+    doc = _load_readable_doc(ctx, _parse_id(doc_id, "document_id"))
     return {k: doc[k] for k in
             ("id", "title", "source_name", "file_type", "char_count", "visibility",
              "owner_user_id", "owner_team", "owner_dept", "created_at", "updated_at")}
@@ -350,7 +394,7 @@ def get_document(h, ctx, doc_id):
 
 @Handler.route("DELETE", "/api/documents/{doc_id}")
 def delete_document(h, ctx, doc_id):
-    doc = _load_owned_doc(ctx, int(doc_id))
+    doc = _load_managed_doc(ctx, _parse_id(doc_id, "document_id"))
     blob_rel = db_tenant.delete_document(ctx.tconn, doc["id"], ctx.user["tenant_id"])
     ctx.tconn.commit()
     if blob_rel:
@@ -361,15 +405,15 @@ def delete_document(h, ctx, doc_id):
 @Handler.route("GET", "/api/documents/{doc_id}/chunks")
 def list_document_chunks(h, ctx, doc_id):
     """列出文档片段及每个片段的可见性/授权（仅管理者看全量；普通用户只看可见片段）。"""
-    doc = db_tenant.get_document(ctx.tconn, int(doc_id), ctx.user["tenant_id"])
-    if doc is None:
-        raise ApiError(404, "文档不存在")
+    doc_id = _parse_id(doc_id, "document_id")
+    doc = _load_readable_doc(ctx, doc_id)
     identity = ctx.identity
     is_manager = permissions.can_manage_document(identity, doc)
     chunks = db_tenant.list_chunks(ctx.tconn, doc["id"])
     result = []
     for c in chunks:
         item = {
+            "document_id": doc["id"],
             "chunk_id": c["id"], "chunk_index": c["chunk_index"],
             "heading_path": c["heading_path"],
             "visibility": c["visibility"] or f"inherit({doc['visibility']})",
@@ -395,12 +439,14 @@ def list_document_chunks(h, ctx, doc_id):
 @Handler.route("GET", "/api/documents/{doc_id}/chunks/{chunk_id}/source")
 def chunk_source(h, ctx, doc_id, chunk_id):
     """溯源：返回片段在原文中的精确定位与上下文（受权限控制）。"""
+    doc_id = _parse_id(doc_id, "document_id")
+    chunk_id = _parse_id(chunk_id, "chunk_id")
     where, params = permissions.accessible_chunks_where(ctx.identity)
     row = ctx.tconn.execute(
         f"""SELECT c.*, d.title, d.source_name, d.full_text
             FROM chunks c JOIN documents d ON d.id=c.document_id
             WHERE c.id=? AND c.document_id=? AND {where}""",
-        [int(chunk_id), int(doc_id)] + params,
+        [chunk_id, doc_id] + params,
     ).fetchone()
     if row is None:
         raise ApiError(404, "片段不存在或无权访问")
@@ -422,8 +468,9 @@ def chunk_source(h, ctx, doc_id, chunk_id):
 # ============================== 片段级权限 ==============================
 
 def _load_managed_chunk(ctx, chunk_id):
+    chunk_id = _parse_id(chunk_id, "chunk_id")
     row = ctx.tconn.execute(
-        "SELECT * FROM chunks WHERE id=?", (int(chunk_id),)
+        "SELECT * FROM chunks WHERE id=?", (chunk_id,)
     ).fetchone()
     if row is None:
         raise ApiError(404, "片段不存在")
@@ -471,7 +518,9 @@ def add_chunk_grant(h, ctx, chunk_id):
 @Handler.route("DELETE", "/api/chunks/{chunk_id}/grants/{grant_id}")
 def remove_chunk_grant(h, ctx, chunk_id, grant_id):
     row = _load_managed_chunk(ctx, chunk_id)
-    ok = db_tenant.delete_grant(ctx.tconn, int(grant_id), row["id"])
+    ok = db_tenant.delete_grant(
+        ctx.tconn, _parse_id(grant_id, "grant_id"), row["id"]
+    )
     if not ok:
         raise ApiError(404, "授权记录不存在")
     db_tenant.bump_document_version(ctx.tconn, row["document_id"])
@@ -486,7 +535,7 @@ def search(h, ctx):
     query = (data.get("query") or "").strip()
     if not query:
         raise ApiError(400, "query 必填")
-    top_k = int(data.get("top_k") or config.SEARCH_TOP_K)
+    top_k = _parse_topk(data.get("top_k") or config.SEARCH_TOP_K)
     results = search_index.search(ctx.tenant_slug, ctx.tconn, ctx.identity, query, top_k)
     db_tenant.log_query(ctx.tconn, ctx.user["user_id"], query, len(results))
     return {"query": query, "count": len(results), "results": results}
@@ -498,7 +547,7 @@ def ask(h, ctx):
     question = (data.get("question") or data.get("query") or "").strip()
     if not question:
         raise ApiError(400, "question 必填")
-    top_k = int(data.get("top_k") or config.SEARCH_TOP_K)
+    top_k = _parse_topk(data.get("top_k") or config.SEARCH_TOP_K)
     result = answer_question(ctx.tenant_slug, ctx.tconn, ctx.identity, question, top_k)
     db_tenant.log_query(ctx.tconn, ctx.user["user_id"], question, len(result["sources"]))
     return result

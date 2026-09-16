@@ -1,0 +1,5 @@
+1 公开段
+这段是 OVERRIDE-PUBLIC-888 应被全员看到。
+
+2 私有段
+这段是 PRIVATE-ONLY-777 仅所有者。

@@ -46,9 +46,16 @@
   .score { color:var(--muted); font-size:11px; }
   .exact { background:#fff3bf; padding:0 2px; border-radius:3px; }
   code { background:#f0f3f2; padding:1px 5px; border-radius:4px; }
+  #modalMask { position:fixed; inset:0; background:rgba(20,30,27,.45); display:none;
+     align-items:center; justify-content:center; z-index:50; }
+  #modalBox { background:#fff; border-radius:12px; max-width:720px; width:92%;
+     max-height:80vh; overflow:auto; padding:22px 24px; box-shadow:0 12px 40px rgba(0,0,0,.2); }
 </style>
 </head>
 <body>
+<div id="modalMask" onclick="if(event.target===this)closeModal()">
+  <div id="modalBox"></div>
+</div>
 <header>
   <h1>🔬 权限感知型私有科研知识库问答系统</h1>
   <div id="who"></div>
@@ -118,7 +125,7 @@
 </main>
 
 <script>
-let TOKEN = null, ME = null;
+let TOKEN = null, ME = null, CURRENT_DOC_ID = null;
 
 async function api(method, path, body, isForm) {
   const opt = { method, headers: {} };
@@ -207,6 +214,7 @@ async function delDoc(id) {
 }
 
 async function viewChunks(docId) {
+  CURRENT_DOC_ID = docId;
   const r = await api("GET", `/api/documents/${docId}/chunks`);
   const panel = document.getElementById("chunkPanel");
   if (r.status !== 200) { panel.innerHTML = "❌ " + r.data.error; return; }
@@ -244,28 +252,35 @@ async function setVis(cid) {
   const r = await api("PUT", `/api/chunks/${cid}/visibility`, { visibility: v });
   alert(r.data.error || r.data.message);
   loadDocs();
+  if (CURRENT_DOC_ID) viewChunks(CURRENT_DOC_ID);
 }
 async function addGrant(cid) {
   const t = document.getElementById("gt_"+cid).value;
   const v = document.getElementById("gv_"+cid).value.trim();
   if (!v) { alert("请填写授权对象"); return; }
   const r = await api("POST", `/api/chunks/${cid}/grants`, { subject_type:t, subject_value:v });
-  alert(r.data.error || "授权成功");
+  if (r.data.error) { alert(r.data.error); return; }
   loadDocs();
+  if (CURRENT_DOC_ID) viewChunks(CURRENT_DOC_ID);
 }
 async function rmGrant(cid, gid) {
   const r = await api("DELETE", `/api/chunks/${cid}/grants/${gid}`);
-  if (r.data.error) alert(r.data.error);
-  // 重新展开当前文档
-  const docId = document.querySelector("#chunkPanel .src")?.id;
+  if (r.data.error) { alert(r.data.error); return; }
+  if (CURRENT_DOC_ID) viewChunks(CURRENT_DOC_ID);
 }
 async function viewSource(docId, cid) {
   const r = await api("GET", `/api/documents/${docId}/chunks/${cid}/source`);
-  if (r.status !== 200) { alert(r.data.error); return; }
+  if (r.status !== 200) { alert(r.data.error || "无权查看该片段原文"); return; }
   const s = r.data;
-  alert(`《${s.title}》 ${s.heading_path ? "["+s.heading_path+"] " : ""}` +
-        `${s.page_start ? "第"+s.page_start+"页 " : ""}字符[${s.char_range[0]},${s.char_range[1]})\n\n` +
-        (s.before ? "…"+s.before : "") + "\n【" + s.exact_text + "】\n" + (s.after ? s.after+"…" : ""));
+  const loc = `${s.page_start ? "第"+s.page_start+"页 · " : ""}字符[${s.char_range[0]}, ${s.char_range[1]})`;
+  const html = `<h2 style="margin-top:0">📄 《${escapeHtml(s.title)}》</h2>
+    <p class="muted">${s.heading_path ? "章节："+escapeHtml(s.heading_path)+" · " : ""}${loc}</p>
+    <div style="line-height:1.8;font-size:14px">
+      ${s.before ? '<span class="muted">…'+escapeHtml(s.before)+'</span>' : ""}
+      <span class="exact">${escapeHtml(s.exact_text)}</span>
+      ${s.after ? '<span class="muted">'+escapeHtml(s.after)+"…</span>" : ""}
+    </div><div style="margin-top:14px;text-align:right"><button onclick="closeModal()">关闭</button></div>`;
+  showModal(html);
 }
 
 async function ask() {
@@ -293,6 +308,11 @@ const srcHtml = s => `<div class="src">📄 <b>《${s.document_title}》</b>
   ${s.section ? "【"+s.section+"】" : ""} <span class="score">片段#${s.chunk_index} ·
   ${s.location} · 字符[${s.char_range[0]},${s.char_range[1]}) · BM25=${s.score}</span></div>`;
 const escapeHtml = s => (s||"").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+function showModal(html) {
+  document.getElementById("modalBox").innerHTML = html;
+  document.getElementById("modalMask").style.display = "flex";
+}
+function closeModal() { document.getElementById("modalMask").style.display = "none"; }
 
 loadTenants();
 </script>
