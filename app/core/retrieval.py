@@ -17,7 +17,7 @@ import threading
 from dataclasses import dataclass
 
 from .. import config
-from . import permissions
+from . import db_tenant, permissions
 
 # 字母数字与下划线视为同一标识符（兼容 DONOR_2026_017、BE4max 等科研编号）；
 # 连字符仍作为分隔（LPN-207 -> lpn / 207）。
@@ -56,14 +56,9 @@ class TenantSearchIndex:
 
     @staticmethod
     def _version_fingerprint(conn) -> tuple:
-        row = conn.execute(
-            """SELECT
-                 (SELECT COALESCE(SUM(index_version),0) FROM documents) AS dv,
-                 (SELECT COUNT(*) FROM documents) AS dc,
-                 (SELECT COALESCE(SUM(index_version),0) FROM chunks) AS cv,
-                 (SELECT COUNT(*) FROM chunk_grants) AS gc"""
-        ).fetchone()
-        return tuple(row)
+        # 单调递增代数：新增/删除文档、改可见性/密级/规则都会 +1，
+        # 不会因“删除后重传同构文档”而撞回旧指纹。
+        return (db_tenant.index_generation(conn),)
 
     def _get_index(self, tenant_slug: str, conn) -> _Index:
         fp = self._version_fingerprint(conn)

@@ -384,15 +384,22 @@ def upload_document(h, ctx):
 def list_documents(h, ctx):
     where, params = permissions.accessible_document_where(ctx.identity)
     rows = ctx.tconn.execute(
-        f"""SELECT d.id, d.title, d.source_name, d.file_type, d.char_count,
-                   d.visibility, d.classification,
-                   d.owner_user_id, d.owner_team, d.owner_dept,
-                   d.created_at, d.updated_at,
-                   (SELECT COUNT(*) FROM chunks c WHERE c.document_id=d.id) AS chunk_count
+        f"""SELECT d.id, d.title, d.source_name, d.file_type,
+                   d.visibility, d.owner_user_id, d.owner_team, d.owner_dept,
+                   d.created_at, d.updated_at
             FROM documents d WHERE {where} ORDER BY d.id DESC""",
         params,
     ).fetchall()
-    return [dict(r) for r in rows]
+    stats = permissions.visible_document_stats(
+        ctx.tconn, ctx.identity, [r["id"] for r in rows]
+    )
+    result = []
+    for r in rows:
+        item = dict(r)
+        item.update(stats.get(r["id"], {"chunk_count": 0, "char_count": 0,
+                                        "classification": None}))
+        result.append(item)
+    return result
 
 
 def _load_managed_doc(ctx, doc_id) -> dict:
@@ -416,10 +423,20 @@ def _load_readable_doc(ctx, doc_id) -> dict:
 @Handler.route("GET", "/api/documents/{doc_id}")
 def get_document(h, ctx, doc_id):
     doc = _load_readable_doc(ctx, _parse_id(doc_id, "document_id"))
-    return {k: doc[k] for k in
-            ("id", "title", "source_name", "file_type", "char_count", "visibility",
-             "classification", "owner_user_id", "owner_team", "owner_dept",
-             "created_at", "updated_at")}
+    # 只返回当前用户可见片段的聚合信封，避免暴露整篇密级/隐藏片段数/全文字数
+    stats = permissions.visible_document_stats(
+        ctx.tconn, ctx.identity, [doc["id"]]
+    ).get(doc["id"], {"chunk_count": 0, "char_count": 0, "classification": None})
+    return {
+        "id": doc["id"], "title": doc["title"], "source_name": doc["source_name"],
+        "file_type": doc["file_type"], "visibility": doc["visibility"],
+        "owner_user_id": doc["owner_user_id"], "owner_team": doc["owner_team"],
+        "owner_dept": doc["owner_dept"], "created_at": doc["created_at"],
+        "updated_at": doc["updated_at"],
+        "char_count": stats["char_count"],
+        "chunk_count": stats["chunk_count"],
+        "classification": stats["classification"],
+    }
 
 
 @Handler.route("DELETE", "/api/documents/{doc_id}")

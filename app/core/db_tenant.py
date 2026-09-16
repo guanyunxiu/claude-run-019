@@ -80,6 +80,14 @@ CREATE TABLE IF NOT EXISTS query_logs (
     hit_count   INTEGER NOT NULL DEFAULT 0,
     created_at  REAL NOT NULL
 );
+
+-- 租户级单调递增的「索引代数」：任何会改变检索白名单/倒排内容的操作都 +1。
+-- 用单调计数器而不是“版本号加总+行数”，避免删除后重传同构文档指纹撞回旧值。
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO meta(key, value) VALUES ('index_generation', 0);
 """
 
 # 增量迁移：对旧库补齐新列/新表
@@ -130,6 +138,16 @@ def connect(tenant_slug: str, tenant_id: int) -> sqlite3.Connection:
 
 # ---------------- 文档 ----------------
 
+def bump_index_generation(conn) -> int:
+    """租户检索索引代数 +1，返回新值。任何改变检索白名单/倒排内容的操作都调用它。"""
+    conn.execute("UPDATE meta SET value = value + 1 WHERE key='index_generation'")
+    return conn.execute("SELECT value FROM meta WHERE key='index_generation'").fetchone()[0]
+
+
+def index_generation(conn) -> int:
+    return conn.execute("SELECT value FROM meta WHERE key='index_generation'").fetchone()[0]
+
+
 def create_document(conn, *, tenant_id: int, title: str, source_name: str, file_type: str,
                     blob_path: str, full_text: str, visibility: str,
                     owner_user_id: int, owner_team: str | None, owner_dept: str | None,
@@ -149,11 +167,12 @@ def create_document(conn, *, tenant_id: int, title: str, source_name: str, file_
 
 
 def bump_document_version(conn, document_id: int) -> None:
-    """权限或内容变更时递增版本号，使该租户的 BM25 内存索引缓存失效。"""
+    """权限或内容变更时：文档版本号 +1，并使租户 BM25 内存索引（按代数缓存）失效。"""
     conn.execute(
         "UPDATE documents SET index_version=index_version+1, updated_at=? WHERE id=?",
         (time.time(), document_id),
     )
+    bump_index_generation(conn)
 
 
 def get_document(conn, document_id: int, tenant_id: int):
@@ -179,6 +198,7 @@ def delete_document(conn, document_id: int, tenant_id: int) -> str | None:
         return None
     conn.execute("DELETE FROM chunks WHERE document_id=?", (document_id,))
     conn.execute("DELETE FROM documents WHERE id=? AND tenant_id=?", (document_id, tenant_id))
+    bump_index_generation(conn)
     return row["blob_path"]
 
 

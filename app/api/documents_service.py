@@ -83,6 +83,7 @@ def ingest_upload(*, tconn, tenant_id: int, tenant_slug: str,
                 page_end=spec.page_end,
                 visibility=None,  # 默认继承文档可见性，可后续单独绑定
             )
+        db_tenant.bump_index_generation(tconn)
         tconn.commit()
     except Exception:
         blob_path.unlink(missing_ok=True)

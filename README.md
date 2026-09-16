@@ -111,7 +111,12 @@ python3 tests/test_api.py
   `accessible_document_where`），保证语义一致：**文档可见当且仅当至少存在一个可访问片段**，
   因此不会出现“列表/详情 200 但检索为 0、片段列表为空”的空壳文档——public/team 文档
   若全部片段被 deny（或密级全部不足），列表与详情同样不返回；能进入文档就至少能看到一个片段。
-- 任何密级/规则/授权变更都 `bump_document_version`，BM25 白名单按请求实时计算、即时生效。
+- **信封不泄露隐藏分片**：对仅能访问部分片段的用户，列表/详情返回的 `classification`
+  是“可见片段中的最高密级”（不是整篇密级），`chunk_count`/`char_count` 只统计可见片段，
+  避免通过文档信封推断隐藏分片数量、字数与密级；管理员/所有者看到的是整篇真实值。
+- 任何密级/规则/授权变更、文档新增/删除都递增租户级**单调索引代数**（`meta.index_generation`），
+  BM25 内存倒排按代数缓存并实时重建；用单调计数器而非“版本号加总+行数”，避免删除后重传
+  同构文档时指纹撞回旧值。
 - 接口：
   - 成员密级：`PUT /api/admin/members/{uid}/clearance`，加成员时可传 `clearance`；
   - 文档密级：`PUT /api/documents/{id}/classification`（上传可带 `classification`）；

@@ -42,6 +42,14 @@ def clearance_rank(name) -> int:
     return CLEARANCE_LEVELS.get(name, 0)
 
 
+def classification_name(rank: int) -> str:
+    return {0: "internal", 1: "sensitive", 2: "secret"}.get(int(rank), "internal")
+
+
+def classification_case(column: str) -> str:
+    return _classification_case(column)
+
+
 class _B:
     """有序 SQL 片段构建器：params 与 SQL 中 ? 的出现顺序严格一致。"""
 
@@ -180,6 +188,43 @@ def accessible_chunk_ids(conn, ctx: dict, document_id: int,
         [document_id] + params,
     ).fetchall()
     return {r[0] for r in rows}
+
+
+def visible_document_stats(conn, ctx: dict, document_ids: list[int] | None = None,
+                           now: float | None = None) -> dict[int, dict]:
+    """按当前用户的可访问片段聚合文档信封信息。
+
+    返回 {document_id: {chunk_count, char_count, classification}}：
+      - chunk_count/char_count 只统计 ACL/密级/deny/时限均通过的片段；
+      - classification 是这些可见片段中的最高有效密级，而不是整篇文档密级，
+        从而不向部分可见用户暴露隐藏分片数量与密级信封。
+    """
+    where, params = accessible_chunks_where(ctx, now)
+    id_filter = ""
+    id_params: list = []
+    if document_ids is not None:
+        if not document_ids:
+            return {}
+        id_filter = "AND d.id IN (%s)" % ",".join("?" * len(document_ids))
+        id_params = list(document_ids)
+    rows = conn.execute(
+        f"""SELECT d.id AS document_id,
+                   COUNT(*) AS visible_chunk_count,
+                   COALESCE(SUM(c.char_end - c.char_start), 0) AS visible_char_count,
+                   MAX({_classification_case(_EFF_CLS)}) AS visible_class_rank
+            FROM chunks c JOIN documents d ON d.id = c.document_id
+            WHERE {where} {id_filter}
+            GROUP BY d.id""",
+        params + id_params,
+    ).fetchall()
+    return {
+        r["document_id"]: {
+            "chunk_count": r["visible_chunk_count"],
+            "char_count": r["visible_char_count"],
+            "classification": classification_name(r["visible_class_rank"]),
+        }
+        for r in rows
+    }
 
 
 # ---------------- 管理权限（仅限本租户管理员/文档所有者，不随密级/deny 变化） ----------------
