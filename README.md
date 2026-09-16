@@ -69,11 +69,16 @@ python3 tests/test_api.py
 
 ### 3. 细粒度权限绑定
 - 文档级：`private`（私有）/ `team`（团队公开）/ `department`（部门公开）/ `public`（租户公开）。
+  上传时若选 team/department，归属团队/部门**必填**（缺省取上传者本人的团队/部门；
+  上传者自身没有归属时必须显式填写），否则返回 400，避免产生「除所有者外无人可见」的文档。
 - 片段级：`chunks.visibility` 可**单独覆盖**文档可见性（`NULL` = 继承文档）。
 - 片段附加授权 `chunk_grants`：向**指定用户 / 指定角色 / 指定团队 / 指定部门**放行单个片段。
 - 管理权限：租户管理员可管理本租户全部内容；文档所有者可管理其文档与片段。
 - **读权限与管理权分离**：同团队/同部门/被片段授权的成员可查看文档详情、片段与溯源原文，
   但不能改可见性、加授权或删除（`can_read_document` vs `can_manage_document`）。
+- **文档列表与片段可见性一致**：若私有文档中某个片段被单独覆盖为 public/team/department
+  （或被附加授权），该文档会出现在对应可访问者的文档列表中，点进去只能看到其有权的片段；
+  列表谓词复用片段级 effective-visibility 判定，保证“检索/问答能命中 ⇔ 列表能进入”。
 - 接口：`PUT /api/chunks/{id}/visibility`、`POST /api/chunks/{id}/grants`、
   `DELETE /api/chunks/{id}/grants/{gid}`。
 
@@ -99,7 +104,9 @@ python3 tests/test_api.py
 - 默认**内置抽取式问答**（离线、无密钥）：基于检索命中片段做查询覆盖度句级抽取。
 - 可选 **LLM 生成式**：配置 `LLM_BASE_URL / LLM_API_KEY / LLM_MODEL`（OpenAI 兼容
   `/chat/completions`）后，将“**已通过权限过滤**”的片段作为唯一上下文，要求模型只依据资料作答
-  并标注 `[来源n]`；LLM 不可用时自动降级为抽取式。
+  并标注 `[来源n]`；LLM 调用失败或返回为空时自动降级为抽取式，响应中
+  `mode="extractive"`、`degraded=true`，前端明确提示“已配置 LLM 但调用失败，已自动降级”，
+  不会误显示为“LLM 生成”。
 - 每条回答附 `sources`：**原文文档名、源文件名、章节路径、片段序号、页码、字符区间、BM25 分**；
   溯源接口 `GET /api/documents/{id}/chunks/{cid}/source` 返回片段精确原文与前后文。
 

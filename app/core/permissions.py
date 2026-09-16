@@ -23,6 +23,32 @@ VALID_VIS = ("private", "team", "department", "public")
 VALID_SUBJECTS = ("user", "role", "team", "department")
 
 
+def _chunk_access_predicate(uid, role, team, dept, uid_s) -> tuple[str, list]:
+    """单个片段对当前用户可访问的内部条件（别名固定为 c / d）。
+
+    覆盖：片段有效可见性（COALESCE(c.visibility, d.visibility)）的四级判定，
+    以及 chunk_grants 的 用户/角色/团队/部门 四类附加授权。
+    """
+    pred = f"""(
+            ? = 'admin'
+            OR {_EFF_VIS} = 'public'
+            OR ({_EFF_VIS} = 'private'    AND d.owner_user_id = ?)
+            OR ({_EFF_VIS} = 'team'       AND d.owner_team IS NOT NULL AND d.owner_team = ?)
+            OR ({_EFF_VIS} = 'department' AND d.owner_dept IS NOT NULL AND d.owner_dept = ?)
+            OR EXISTS (
+                SELECT 1 FROM chunk_grants g
+                WHERE g.chunk_id = c.id AND (
+                       (g.subject_type='user'       AND g.subject_value = ?)
+                    OR (g.subject_type='role'       AND g.subject_value = ?)
+                    OR (g.subject_type='team'       AND g.subject_value = ?)
+                    OR (g.subject_type='department' AND g.subject_value = ?)
+                )
+            )
+        )"""
+    params = [role, uid, team, dept, uid_s, role, team, dept]
+    return pred, params
+
+
 def accessible_chunks_where(ctx: dict) -> tuple[str, list]:
     """生成「用户可访问片段」的 SQL 片段与参数（权限穿透式检索的核心过滤谓词）。
 
@@ -35,38 +61,28 @@ def accessible_chunks_where(ctx: dict) -> tuple[str, list]:
     dept = ctx.get("department")
     uid_s = str(uid)
 
-    where = f"""
-        d.tenant_id = ?
-        AND (
-            ? = 'admin'
-            OR {_EFF_VIS} = 'public'
-            OR ({_EFF_VIS} = 'private'    AND d.owner_user_id = ?)
-            OR ({_EFF_VIS} = 'team'       AND d.owner_team IS NOT NULL       AND d.owner_team = ?)
-            OR ({_EFF_VIS} = 'department' AND d.owner_dept IS NOT NULL       AND d.owner_dept = ?)
-            OR EXISTS (
-                SELECT 1 FROM chunk_grants g
-                WHERE g.chunk_id = c.id AND (
-                       (g.subject_type='user'       AND g.subject_value = ?)
-                    OR (g.subject_type='role'       AND g.subject_value = ?)
-                    OR (g.subject_type='team'       AND g.subject_value = ?)
-                    OR (g.subject_type='department' AND g.subject_value = ?)
-                )
-            )
-        )
-    """
-    params = [ctx["tenant_id"], role, uid, team, dept, uid_s, role, team, dept]
-    return where, params
+    pred, pred_params = _chunk_access_predicate(uid, role, team, dept, uid_s)
+    where = f"d.tenant_id = ? AND {pred}"
+    return where, [ctx["tenant_id"]] + pred_params
 
 
 def accessible_document_where(ctx: dict) -> tuple[str, list]:
-    """文档列表可见性：基础可见性，或存在任意一个被额外授权给该用户的片段。"""
+    """文档列表可见性。
+
+    文档可见，当且仅当满足下列任一：
+      - 文档级可见性（public/private 所有者/team/department）直接放行；
+      - 存在对该用户附加授权的片段（chunk_grants）；
+      - 存在「片段级可见性覆盖后」对该用户可访问的片段（如 private 文档中
+        某片段被覆盖为 public/team/department）。
+    """
     uid = ctx["user_id"]
     role = ctx.get("tenant_role") or "member"
     team = ctx.get("team")
     dept = ctx.get("department")
     uid_s = str(uid)
 
-    where = """
+    chunk_pred, chunk_params = _chunk_access_predicate(uid, role, team, dept, uid_s)
+    where = f"""
         d.tenant_id = ?
         AND (
             ? = 'admin'
@@ -75,17 +91,11 @@ def accessible_document_where(ctx: dict) -> tuple[str, list]:
             OR (d.visibility = 'team'       AND d.owner_team IS NOT NULL AND d.owner_team = ?)
             OR (d.visibility = 'department' AND d.owner_dept IS NOT NULL AND d.owner_dept = ?)
             OR EXISTS (
-                SELECT 1 FROM chunks c JOIN chunk_grants g ON g.chunk_id = c.id
-                WHERE c.document_id = d.id AND (
-                       (g.subject_type='user'       AND g.subject_value = ?)
-                    OR (g.subject_type='role'       AND g.subject_value = ?)
-                    OR (g.subject_type='team'       AND g.subject_value = ?)
-                    OR (g.subject_type='department' AND g.subject_value = ?)
-                )
+                SELECT 1 FROM chunks c WHERE c.document_id = d.id AND {chunk_pred}
             )
         )
     """
-    params = [ctx["tenant_id"], role, uid, team, dept, uid_s, role, team, dept]
+    params = [ctx["tenant_id"], role, uid, team, dept] + chunk_params
     return where, params
 
 

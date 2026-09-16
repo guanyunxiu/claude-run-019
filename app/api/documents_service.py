@@ -26,6 +26,11 @@ def ingest_upload(*, tconn, tenant_id: int, tenant_slug: str,
         raise ValueError(f"文件超过大小上限 {config.MAX_UPLOAD_MB}MB")
     if visibility not in ("private", "team", "department", "public"):
         raise ValueError("visibility 必须是 private/team/department/public")
+    # 团队/部门可见必须有对应归属，否则会产生「除所有者外谁都看不到」的文档
+    if visibility == "team" and not (owner_team or "").strip():
+        raise ValueError("选择「团队公开」时必须指定归属团队（上传者本人未设置团队时请手动填写）")
+    if visibility == "department" and not (owner_dept or "").strip():
+        raise ValueError("选择「部门公开」时必须指定归属部门（上传者本人未设置部门时请手动填写）")
 
     file_type = ext.lstrip(".")
     # 原文件保存在该租户的独立目录（多租户文件级隔离）

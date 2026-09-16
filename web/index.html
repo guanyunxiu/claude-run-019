@@ -289,8 +289,11 @@ async function ask() {
   const r = await api("POST", "/api/ask", { question:q });
   const box = document.getElementById("qaResult");
   if (r.status !== 200) { box.innerHTML = "❌ " + r.data.error; return; }
+  const modeLabel = r.data.mode === "llm" ? "LLM 生成"
+    : (r.data.degraded ? "内置抽取式（已配置 LLM 但调用失败，已自动降级）"
+                       : "内置抽取式（离线）");
   box.innerHTML = `<div class="answer">${escapeHtml(r.data.answer)}</div>
-    <p class="muted">回答模式：${r.data.mode==="llm" ? "LLM 生成" : "内置抽取式（离线）"} · 来源 ${r.data.sources.length} 条</p>` +
+    <p class="muted">回答模式：${modeLabel} · 来源 ${r.data.sources.length} 条</p>` +
     r.data.sources.map(srcHtml).join("");
 }
 async function doSearch() {

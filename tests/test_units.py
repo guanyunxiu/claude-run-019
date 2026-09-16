@@ -76,6 +76,11 @@ class TestTokenizer(unittest.TestCase):
         self.assertIn("封率", strong)
         self.assertIn("包", weak)  # 单字在 weak
 
+    def test_underscore_identifier(self):
+        # 下划线属于标识符内部，兼容 DONOR_2026_017 这类科研编号
+        strong, _ = tokenize("DONOR_2026_017")
+        self.assertIn("donor_2026_017", strong)
+
     def test_single_char_query_falls_back(self):
         strong, weak = tokenize("率")
         self.assertEqual(strong, [])

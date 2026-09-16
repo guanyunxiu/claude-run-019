@@ -150,6 +150,8 @@ def seed_demo():
     # 租户与成员关系
     biolab = _ensure_tenant(gconn, "biolab", "生物实验室", "alice@lab.cn")
     chemmat = _ensure_tenant(gconn, "chemmat", "化学材料中心", "erin@chem.cn")
+    # 管理员同样需要团队/部门归属，否则其上传的「团队/部门公开」文档无人可见
+    db_global.add_tenant_member(gconn, biolab, alice, "admin", "分子生物学团队", "研发部")
     db_global.add_tenant_member(gconn, biolab, bob, "member", "分子生物学团队", "研发部")
     db_global.add_tenant_member(gconn, biolab, carol, "member", "细胞生物学团队", "研发部")
     db_global.add_tenant_member(gconn, biolab, dave, "member", "基因治疗团队", "临床部")

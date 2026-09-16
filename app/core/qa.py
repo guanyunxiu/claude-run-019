@@ -140,10 +140,15 @@ def answer_question(tenant_slug: str, conn, ctx: dict, question: str,
                     top_k: int | None = None) -> dict:
     hits = search_index.search(tenant_slug, conn, ctx, question, top_k=top_k)
     used_hits = hits
-    llm_enabled = bool(hits and config.LLM_BASE_URL and config.LLM_API_KEY)
+    llm_configured = bool(hits and config.LLM_BASE_URL and config.LLM_API_KEY)
     answer = None
-    if llm_enabled:
-        answer = _llm_answer(question, hits)
+    used_llm = False
+    if llm_configured:
+        llm_text = _llm_answer(question, hits)
+        # 仅当 LLM 真正返回非空答案时才算 llm；调用失败/为空都走抽取式降级
+        if llm_text and llm_text.strip():
+            answer = llm_text.strip()
+            used_llm = True
     if answer is None:
         if hits:
             answer, used_hits = _extractive_answer(question, hits)
@@ -152,6 +157,9 @@ def answer_question(tenant_slug: str, conn, ctx: dict, question: str,
     return {
         "question": question,
         "answer": answer,
-        "mode": "llm" if (answer is not None and llm_enabled) else "extractive",
+        # 配置了 LLM 但实际降级时，明确标注为 extractive（前端不再误显示“LLM 生成”）
+        "mode": "llm" if used_llm else "extractive",
+        "llm_configured": llm_configured,
+        "degraded": llm_configured and not used_llm,
         "sources": _sources(used_hits if used_hits else hits),
     }

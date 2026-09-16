@@ -337,18 +337,22 @@ def upload_document(h, ctx):
     f = files["file"]
     fields = body["fields"]
     visibility = fields.get("visibility", "private")
-    result = ingest_upload(
-        tconn=ctx.tconn,
-        tenant_id=ctx.user["tenant_id"],
-        tenant_slug=ctx.tenant_slug,
-        owner_user_id=ctx.user["user_id"],
-        filename=f["filename"],
-        content=f["content"],
-        title=fields.get("title") or None,
-        visibility=visibility,
-        owner_team=fields.get("owner_team") or ctx.user.get("team"),
-        owner_dept=fields.get("owner_dept") or ctx.user.get("department"),
-    )
+    try:
+        result = ingest_upload(
+            tconn=ctx.tconn,
+            tenant_id=ctx.user["tenant_id"],
+            tenant_slug=ctx.tenant_slug,
+            owner_user_id=ctx.user["user_id"],
+            filename=f["filename"],
+            content=f["content"],
+            title=fields.get("title") or None,
+            visibility=visibility,
+            owner_team=(fields.get("owner_team") or "").strip() or ctx.user.get("team"),
+            owner_dept=(fields.get("owner_dept") or "").strip() or ctx.user.get("department"),
+        )
+    except ValueError as e:
+        # 入库参数/解析类错误属于客户端问题，返回 400 而非 500
+        raise ApiError(400, str(e))
     return result
 
 

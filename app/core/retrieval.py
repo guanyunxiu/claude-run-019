@@ -19,7 +19,9 @@ from dataclasses import dataclass
 from .. import config
 from . import permissions
 
-_TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*|[一-鿿]")
+# 字母数字与下划线视为同一标识符（兼容 DONOR_2026_017、BE4max 等科研编号）；
+# 连字符仍作为分隔（LPN-207 -> lpn / 207）。
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[一-鿿]")
 
 
 def tokenize(text: str) -> tuple[list[str], list[str]]:
