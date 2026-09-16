@@ -245,6 +245,7 @@ def me(h, ctx):
         "tenant": {"id": u["tenant_id"], "slug": u["tenant_slug"],
                    "name": u["tenant_name"], "role": u.get("tenant_role")},
         "team": u.get("team"), "department": u.get("department"),
+        "clearance": u.get("clearance") or "internal",
     }
 
 
@@ -286,7 +287,8 @@ def list_members(h, ctx):
         raise ApiError(403, "仅租户管理员可查看成员")
     rows = db_global.list_tenant_members(ctx.gconn, ctx.user["tenant_id"])
     return [{"user_id": r["id"], "email": r["email"], "display_name": r["display_name"],
-             "role": r["role"], "team": r["team"], "department": r["department"]}
+             "role": r["role"], "team": r["team"], "department": r["department"],
+             "clearance": r["clearance"]}
             for r in rows]
 
 
@@ -297,17 +299,37 @@ def add_member(h, ctx):
     data = h._json()
     email = (data.get("email") or "").strip().lower()
     role = data.get("role", "member")
+    clearance = data.get("clearance", "internal")
     if role not in ("admin", "member"):
         raise ApiError(400, "role 必须是 admin 或 member")
+    if clearance not in permissions.CLASSIFICATIONS:
+        raise ApiError(400, f"clearance 必须是 {permissions.CLASSIFICATIONS}")
     user = db_global.get_user_by_email(ctx.gconn, email)
     if user is None:
         raise ApiError(404, "用户不存在，请先让其注册")
     db_global.add_tenant_member(
         ctx.gconn, ctx.user["tenant_id"], user["id"], role,
-        data.get("team") or None, data.get("department") or None,
+        data.get("team") or None, data.get("department") or None, clearance,
     )
     return {"message": f"已将 {email} 加入租户", "role": role,
-            "team": data.get("team"), "department": data.get("department")}
+            "team": data.get("team"), "department": data.get("department"),
+            "clearance": clearance}
+
+
+@Handler.route("PUT", "/api/admin/members/{user_id}/clearance")
+def set_member_clearance(h, ctx, user_id):
+    """调整成员密级许可（clearance）；下次请求令牌上下文即时生效。"""
+    if ctx.user.get("tenant_role") != "admin":
+        raise ApiError(403, "仅租户管理员可调整密级许可")
+    target_id = _parse_id(user_id, "user_id")
+    data = h._json()
+    clearance = data.get("clearance")
+    if clearance not in permissions.CLASSIFICATIONS:
+        raise ApiError(400, f"clearance 必须是 {permissions.CLASSIFICATIONS}")
+    ok = db_global.update_member_clearance(ctx.gconn, ctx.user["tenant_id"], target_id, clearance)
+    if not ok:
+        raise ApiError(404, "该用户不是当前租户成员")
+    return {"message": f"密级许可已更新为 {clearance}", "clearance": clearance}
 
 
 @Handler.route("DELETE", "/api/admin/members/{user_id}")
@@ -337,6 +359,7 @@ def upload_document(h, ctx):
     f = files["file"]
     fields = body["fields"]
     visibility = fields.get("visibility", "private")
+    classification = fields.get("classification", "internal")
     try:
         result = ingest_upload(
             tconn=ctx.tconn,
@@ -349,6 +372,7 @@ def upload_document(h, ctx):
             visibility=visibility,
             owner_team=(fields.get("owner_team") or "").strip() or ctx.user.get("team"),
             owner_dept=(fields.get("owner_dept") or "").strip() or ctx.user.get("department"),
+            classification=classification,
         )
     except ValueError as e:
         # 入库参数/解析类错误属于客户端问题，返回 400 而非 500
@@ -361,7 +385,8 @@ def list_documents(h, ctx):
     where, params = permissions.accessible_document_where(ctx.identity)
     rows = ctx.tconn.execute(
         f"""SELECT d.id, d.title, d.source_name, d.file_type, d.char_count,
-                   d.visibility, d.owner_user_id, d.owner_team, d.owner_dept,
+                   d.visibility, d.classification,
+                   d.owner_user_id, d.owner_team, d.owner_dept,
                    d.created_at, d.updated_at,
                    (SELECT COUNT(*) FROM chunks c WHERE c.document_id=d.id) AS chunk_count
             FROM documents d WHERE {where} ORDER BY d.id DESC""",
@@ -393,7 +418,8 @@ def get_document(h, ctx, doc_id):
     doc = _load_readable_doc(ctx, _parse_id(doc_id, "document_id"))
     return {k: doc[k] for k in
             ("id", "title", "source_name", "file_type", "char_count", "visibility",
-             "owner_user_id", "owner_team", "owner_dept", "created_at", "updated_at")}
+             "classification", "owner_user_id", "owner_team", "owner_dept",
+             "created_at", "updated_at")}
 
 
 @Handler.route("DELETE", "/api/documents/{doc_id}")
@@ -421,6 +447,7 @@ def list_document_chunks(h, ctx, doc_id):
             "chunk_id": c["id"], "chunk_index": c["chunk_index"],
             "heading_path": c["heading_path"],
             "visibility": c["visibility"] or f"inherit({doc['visibility']})",
+            "classification": c["classification"] or f"inherit({doc['classification']})",
             "char_start": c["char_start"], "char_end": c["char_end"],
             "page_start": c["page_start"], "page_end": c["page_end"],
             "content": c["content"][:300],
@@ -442,7 +469,12 @@ def list_document_chunks(h, ctx, doc_id):
 
 @Handler.route("GET", "/api/documents/{doc_id}/chunks/{chunk_id}/source")
 def chunk_source(h, ctx, doc_id, chunk_id):
-    """溯源：返回片段在原文中的精确定位与上下文（受权限控制）。"""
+    """溯源：返回片段在原文中的精确定位与上下文。
+
+    安全要点：before/after 不是简单地按 char_start±120 截取全文，而是先用
+    当前用户在本文档内「可访问片段」的字符边界裁切——上下文窗口不得滑入相邻
+    无权片段（混密级 / 邻接 deny / 过期授权），否则会通过原文窗口泄权。
+    """
     doc_id = _parse_id(doc_id, "document_id")
     chunk_id = _parse_id(chunk_id, "chunk_id")
     where, params = permissions.accessible_chunks_where(ctx.identity)
@@ -454,18 +486,68 @@ def chunk_source(h, ctx, doc_id, chunk_id):
     ).fetchone()
     if row is None:
         raise ApiError(404, "片段不存在或无权访问")
+
+    # 本文档内全部可访问片段的字符区间，按文档顺序排列
+    allowed_ids = permissions.accessible_chunk_ids(ctx.tconn, ctx.identity, doc_id)
+    neighbors = ctx.tconn.execute(
+        """SELECT id, char_start, char_end, heading_path FROM chunks
+           WHERE document_id=? ORDER BY char_start""",
+        (doc_id,),
+    ).fetchall()
+
     full = row["full_text"]
     s, e = row["char_start"], row["char_end"]
-    ctx_start = max(0, s - 120)
-    ctx_end = min(len(full), e + 120)
+    win_start, win_end = max(0, s - 120), min(len(full), e + 120)
+
+    block_left = block_right = None  # 造成裁切的最近无权片段（可能连带其标题）
+    for nb in neighbors:
+        if nb["id"] in allowed_ids:
+            continue
+        ns, ne = nb["char_start"], nb["char_end"]
+        # 左侧：无权片段与候选窗口有重叠（其结尾落在窗口起点之后、本片段之前）
+        if ne <= s and ne > win_start:
+            win_start = max(win_start, ne)
+            block_left = nb if block_left is None or ne > block_left["char_end"] else block_left
+        # 右侧：无权片段与候选窗口有重叠（其起点落在本片段之后、窗口终点之前）
+        if ns >= e and ns < win_end:
+            win_end = min(win_end, ns)
+            block_right = nb if block_right is None or ns < block_right["char_start"] else block_right
+
+    win_start = min(win_start, s)
+    win_end = max(win_end, e)
+    before = full[win_start:s]
+    after = full[e:win_end]
+
+    def _heading_tail(heading_path):
+        return heading_path.split("/")[-1].strip() if heading_path else ""
+
+    # 左侧阻断：其标题位于正文之前，已落在 win_start 之外；仅去掉边界残余空白
+    if block_left is not None:
+        before = before.rstrip("\n 　")
+    # 右侧阻断：无权片段的标题行位于其正文之前、仍可能夹在 [e, win_end) 内，需剥除
+    if block_right is not None:
+        title = _heading_tail(block_right["heading_path"])
+        lines = after.split("\n")
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        if title and lines and lines[0].strip() == title:
+            lines.pop(0)
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        after = "\n".join(lines)
+
+    clipped = block_left is not None or block_right is not None
     return {
         "title": row["title"], "source_name": row["source_name"],
         "heading_path": row["heading_path"],
         "page_start": row["page_start"], "page_end": row["page_end"],
         "char_range": [s, e],
-        "before": full[ctx_start:s],
+        "before": before,
         "exact_text": full[s:e],
-        "after": full[e:ctx_end],
+        "after": after,
+        "context_clipped": clipped,
+        "clipped_side": ("left" if block_left is not None else "")
+                        + (",right" if block_right is not None else ""),
     }
 
 
@@ -499,6 +581,39 @@ def set_chunk_visibility(h, ctx, chunk_id):
             "message": "片段可见性已更新" + ("（继承文档）" if vis is None else "")}
 
 
+@Handler.route("PUT", "/api/chunks/{chunk_id}/classification")
+def set_chunk_classification(h, ctx, chunk_id):
+    """设置片段密级（internal/sensitive/secret）或 null 继承文档密级。"""
+    row = _load_managed_chunk(ctx, chunk_id)
+    data = h._json()
+    cls = data.get("classification")
+    if cls is not None and cls not in permissions.CLASSIFICATIONS:
+        raise ApiError(400, f"classification 必须是 {permissions.CLASSIFICATIONS} 或 null(继承)")
+    db_tenant.set_chunk_classification(ctx.tconn, row["id"], cls)
+    db_tenant.bump_document_version(ctx.tconn, row["document_id"])
+    return {"chunk_id": row["id"], "classification": cls,
+            "message": "片段密级已更新" + ("（继承文档）" if cls is None else f"（{cls}）")}
+
+
+def _resolve_expires(data: dict):
+    """支持 expires_in（相对秒数）或 expires_at（绝对 unix 秒）；二者皆无则长期有效。"""
+    import time as _time
+    if data.get("expires_in") is not None:
+        try:
+            seconds = float(data["expires_in"])
+        except (TypeError, ValueError):
+            raise ApiError(400, "expires_in 必须是秒数")
+        if seconds <= 0:
+            raise ApiError(400, "expires_in 必须为正数")
+        return _time.time() + seconds
+    if data.get("expires_at") is not None:
+        try:
+            return float(data["expires_at"])
+        except (TypeError, ValueError):
+            raise ApiError(400, "expires_at 必须是 unix 秒时间戳")
+    return None
+
+
 @Handler.route("POST", "/api/chunks/{chunk_id}/grants")
 def add_chunk_grant(h, ctx, chunk_id):
     row = _load_managed_chunk(ctx, chunk_id)
@@ -513,10 +628,15 @@ def add_chunk_grant(h, ctx, chunk_id):
         if not svalue.isdigit():
             raise ApiError(400, "user 授权的 subject_value 必须是用户数字 ID")
         svalue = str(int(svalue))
-    gid = db_tenant.add_grant(ctx.tconn, row["id"], stype, svalue)
+    effect = data.get("effect", "allow")
+    if effect not in permissions.VALID_EFFECTS:
+        raise ApiError(400, f"effect 必须是 {permissions.VALID_EFFECTS}")
+    expires_at = _resolve_expires(data)
+    gid = db_tenant.add_grant(ctx.tconn, row["id"], stype, svalue, effect, expires_at)
     db_tenant.bump_document_version(ctx.tconn, row["document_id"])
     return {"grant_id": gid, "chunk_id": row["id"],
-            "subject_type": stype, "subject_value": svalue}
+            "subject_type": stype, "subject_value": svalue,
+            "effect": effect, "expires_at": expires_at}
 
 
 @Handler.route("DELETE", "/api/chunks/{chunk_id}/grants/{grant_id}")
@@ -528,7 +648,65 @@ def remove_chunk_grant(h, ctx, chunk_id, grant_id):
     if not ok:
         raise ApiError(404, "授权记录不存在")
     db_tenant.bump_document_version(ctx.tconn, row["document_id"])
-    return {"message": "授权已移除"}
+    return {"message": "规则已移除"}
+
+
+# ============================== 文档级密级 / 规则 ==============================
+
+@Handler.route("PUT", "/api/documents/{doc_id}/classification")
+def set_document_classification(h, ctx, doc_id):
+    doc = _load_managed_doc(ctx, _parse_id(doc_id, "document_id"))
+    data = h._json()
+    cls = data.get("classification")
+    if cls not in permissions.CLASSIFICATIONS:
+        raise ApiError(400, f"classification 必须是 {permissions.CLASSIFICATIONS}")
+    db_tenant.set_document_classification(ctx.tconn, doc["id"], cls)
+    db_tenant.bump_document_version(ctx.tconn, doc["id"])
+    return {"document_id": doc["id"], "classification": cls}
+
+
+@Handler.route("GET", "/api/documents/{doc_id}/rules")
+def list_document_rules(h, ctx, doc_id):
+    doc = _load_managed_doc(ctx, _parse_id(doc_id, "document_id"))
+    return [dict(r) for r in db_tenant.list_document_rules(ctx.tconn, doc["id"])]
+
+
+@Handler.route("POST", "/api/documents/{doc_id}/rules")
+def add_document_rule(h, ctx, doc_id):
+    """文档级规则：对整篇文档所有片段 allow/deny，可时限。"""
+    doc = _load_managed_doc(ctx, _parse_id(doc_id, "document_id"))
+    data = h._json()
+    stype = data.get("subject_type")
+    svalue = (data.get("subject_value") or "").strip()
+    effect = data.get("effect", "deny")
+    if stype not in permissions.VALID_SUBJECTS:
+        raise ApiError(400, f"subject_type 必须是 {permissions.VALID_SUBJECTS}")
+    if effect not in permissions.VALID_EFFECTS:
+        raise ApiError(400, f"effect 必须是 {permissions.VALID_EFFECTS}")
+    if not svalue:
+        raise ApiError(400, "subject_value 必填")
+    if stype == "user":
+        if not svalue.isdigit():
+            raise ApiError(400, "user 规则的 subject_value 必须是用户数字 ID")
+        svalue = str(int(svalue))
+    expires_at = _resolve_expires(data)
+    rid = db_tenant.add_document_rule(ctx.tconn, doc["id"], stype, svalue, effect, expires_at)
+    db_tenant.bump_document_version(ctx.tconn, doc["id"])
+    return {"rule_id": rid, "document_id": doc["id"],
+            "subject_type": stype, "subject_value": svalue,
+            "effect": effect, "expires_at": expires_at}
+
+
+@Handler.route("DELETE", "/api/documents/{doc_id}/rules/{rule_id}")
+def remove_document_rule(h, ctx, doc_id, rule_id):
+    doc = _load_managed_doc(ctx, _parse_id(doc_id, "document_id"))
+    ok = db_tenant.delete_document_rule(
+        ctx.tconn, _parse_id(rule_id, "rule_id"), doc["id"]
+    )
+    if not ok:
+        raise ApiError(404, "规则不存在")
+    db_tenant.bump_document_version(ctx.tconn, doc["id"])
+    return {"message": "文档规则已移除"}
 
 
 # ============================== 检索 / 问答 ==============================

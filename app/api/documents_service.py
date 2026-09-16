@@ -18,7 +18,8 @@ def _ext(filename: str) -> str:
 def ingest_upload(*, tconn, tenant_id: int, tenant_slug: str,
                   owner_user_id: int, filename: str, content: bytes,
                   title: str | None, visibility: str,
-                  owner_team: str | None, owner_dept: str | None) -> dict:
+                  owner_team: str | None, owner_dept: str | None,
+                  classification: str = "internal") -> dict:
     ext = _ext(filename)
     if ext not in config.SUPPORTED_EXT:
         raise ValueError(f"不支持的文件类型 {ext}")
@@ -26,6 +27,8 @@ def ingest_upload(*, tconn, tenant_id: int, tenant_slug: str,
         raise ValueError(f"文件超过大小上限 {config.MAX_UPLOAD_MB}MB")
     if visibility not in ("private", "team", "department", "public"):
         raise ValueError("visibility 必须是 private/team/department/public")
+    if classification not in ("internal", "sensitive", "secret"):
+        raise ValueError("classification 必须是 internal/sensitive/secret")
     # 团队/部门可见必须有对应归属，否则会产生「除所有者外谁都看不到」的文档
     if visibility == "team" and not (owner_team or "").strip():
         raise ValueError("选择「团队公开」时必须指定归属团队（上传者本人未设置团队时请手动填写）")
@@ -61,6 +64,7 @@ def ingest_upload(*, tconn, tenant_id: int, tenant_slug: str,
             blob_path=stored_name,
             full_text=full_text,
             visibility=visibility,
+            classification=classification,
             owner_user_id=owner_user_id,
             owner_team=owner_team,
             owner_dept=owner_dept,
@@ -92,6 +96,7 @@ def ingest_upload(*, tconn, tenant_id: int, tenant_slug: str,
         "char_count": len(full_text),
         "chunk_count": len(specs),
         "visibility": visibility,
+        "classification": classification,
         "chunks_preview": [
             {
                 "index": i + 1,

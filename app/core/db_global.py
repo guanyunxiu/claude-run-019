@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS tenant_users (
     role       TEXT NOT NULL DEFAULT 'member',  -- admin / member
     team       TEXT,                            -- 所属团队（租户内业务分组）
     department TEXT,                            -- 所属部门
+    clearance  TEXT NOT NULL DEFAULT 'internal', -- 密级许可：internal/sensitive/secret
     PRIMARY KEY (tenant_id, user_id)
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -48,6 +49,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_used  REAL NOT NULL
 );
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对已存在的全局库做增量列迁移（SQLite 无 DROP COLUMN IF EXISTS）。"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(tenant_users)")}
+    if "clearance" not in cols:
+        conn.execute("ALTER TABLE tenant_users ADD COLUMN clearance TEXT NOT NULL DEFAULT 'internal'")
 
 
 def connect() -> sqlite3.Connection:
@@ -62,6 +70,7 @@ def init_db() -> None:
     conn = connect()
     try:
         conn.executescript(_SCHEMA)
+        _migrate(conn)
         conn.commit()
     finally:
         conn.close()
@@ -112,13 +121,23 @@ def get_user(conn, user_id: int) -> Optional[sqlite3.Row]:
 
 
 def add_tenant_member(conn, tenant_id: int, user_id: int, role: str = "member",
-                      team: str | None = None, department: str | None = None) -> None:
+                      team: str | None = None, department: str | None = None,
+                      clearance: str = "internal") -> None:
     conn.execute(
-        "INSERT INTO tenant_users(tenant_id, user_id, role, team, department)"
-        " VALUES (?,?,?,?,?) ON CONFLICT(tenant_id, user_id) DO UPDATE SET"
-        " role=excluded.role, team=excluded.team, department=excluded.department",
-        (tenant_id, user_id, role, team, department),
+        "INSERT INTO tenant_users(tenant_id, user_id, role, team, department, clearance)"
+        " VALUES (?,?,?,?,?,?) ON CONFLICT(tenant_id, user_id) DO UPDATE SET"
+        " role=excluded.role, team=excluded.team, department=excluded.department,"
+        " clearance=excluded.clearance",
+        (tenant_id, user_id, role, team, department, clearance),
     )
+
+
+def update_member_clearance(conn, tenant_id: int, user_id: int, clearance: str) -> bool:
+    cur = conn.execute(
+        "UPDATE tenant_users SET clearance=? WHERE tenant_id=? AND user_id=?",
+        (clearance, tenant_id, user_id),
+    )
+    return cur.rowcount > 0
 
 
 def get_membership(conn, tenant_id: int, user_id: int) -> Optional[sqlite3.Row]:
@@ -154,7 +173,7 @@ def list_user_tenants(conn, user_id: int) -> list[sqlite3.Row]:
 
 def list_tenant_members(conn, tenant_id: int):
     return conn.execute(
-        """SELECT u.id, u.email, u.display_name, tu.role, tu.team, tu.department
+        """SELECT u.id, u.email, u.display_name, tu.role, tu.team, tu.department, tu.clearance
            FROM tenant_users tu JOIN users u ON u.id=tu.user_id
            WHERE tu.tenant_id=? ORDER BY u.id""",
         (tenant_id,),
@@ -186,7 +205,7 @@ def resolve_session(conn, token: str) -> Optional[dict]:
     row = conn.execute(
         """SELECT s.token, s.user_id, s.tenant_id, s.expires_at,
                   u.email, u.display_name, u.is_platform_admin,
-                  tu.role AS tenant_role, tu.team, tu.department,
+                  tu.role AS tenant_role, tu.team, tu.department, tu.clearance,
                   t.slug AS tenant_slug, t.name AS tenant_name
            FROM sessions s
            JOIN users u   ON u.id = s.user_id

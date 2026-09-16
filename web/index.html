@@ -106,6 +106,12 @@
           </select></div>
         <div><label>归属团队</label><input type="text" id="ownerTeam" placeholder="留空取本人团队"></div>
         <div><label>归属部门</label><input type="text" id="ownerDept" placeholder="留空取本人部门"></div>
+        <div><label>密级</label>
+          <select id="classification">
+            <option value="internal">internal 内部</option>
+            <option value="sensitive">sensitive 敏感</option>
+            <option value="secret">secret 机密</option>
+          </select></div>
       </div>
       <div style="margin-top:10px"><button onclick="upload()">上传并自动分段</button></div>
       <div id="uploadResult" class="muted"></div>
@@ -161,6 +167,7 @@ async function login() {
   document.getElementById("who").innerHTML =
     `${ME.user.display_name}（${ME.user.email}）<br>租户：${ME.tenant.name} · 角色：${ME.tenant.role}` +
     (ME.team ? `<br>${ME.department||""} / ${ME.team}` : "") +
+    `<br>密级许可：${({internal:"内部",sensitive:"敏感",secret:"机密"})[ME.clearance]||ME.clearance}` +
     ` <a href="#" onclick="logout();return false;" style="color:#fff;text-decoration:underline">退出</a>`;
   loadDocs();
 }
@@ -172,6 +179,13 @@ const visTag = v => {
   const key = (v||"").startsWith("inherit") ? v.slice(8,-1) : v;
   return `<span class="tag ${key}">${v.startsWith("inherit") ? "继承:"+map[key] : (map[v]||v)}</span>`;
 };
+const clsTag = c => {
+  const map = { internal:"内部", sensitive:"敏感", secret:"机密" };
+  const key = (c||"").startsWith("inherit") ? c.slice(8,-1) : c;
+  const color = { secret:"#a34a3c", sensitive:"#b5820a", internal:"#1f6f5c" }[key] || "#666";
+  return `<span class="tag" style="background:${color}1a;color:${color}">` +
+    `${c.startsWith("inherit") ? "继承:" : ""}${map[key]||c}</span>`;
+};
 
 async function upload() {
   const f = document.getElementById("file").files[0];
@@ -182,11 +196,12 @@ async function upload() {
   if (title.value) fd.append("title", title.value);
   if (ownerTeam.value) fd.append("owner_team", ownerTeam.value);
   if (ownerDept.value) fd.append("owner_dept", ownerDept.value);
+  fd.append("classification", document.getElementById("classification").value);
   const r = await api("POST", "/api/documents", fd, true);
   const box = document.getElementById("uploadResult");
   if (r.status !== 200) { box.innerHTML = "❌ " + r.data.error; return; }
   box.innerHTML = `✅ 已入库《${r.data.title}》，正文 ${r.data.char_count} 字，` +
-    `语义分段 <b>${r.data.chunk_count}</b> 个：<br>` +
+    `密级 ${r.data.classification}，语义分段 <b>${r.data.chunk_count}</b> 个：<br>` +
     r.data.chunks_preview.map(c =>
       `片段#${c.index} ${c.heading_path ? "["+c.heading_path+"]" : ""} ${c.chars}字 ` +
       `${c.page_start ? "p."+c.page_start : ""}`).join("<br>");
@@ -199,7 +214,8 @@ async function loadDocs() {
   tb.innerHTML = r.data.map(d => `<tr>
     <td>${d.title}<div class="muted">${d.source_name}</div></td>
     <td>${d.file_type}</td><td>${d.chunk_count}</td>
-    <td>${visTag(d.visibility)}<div class="muted">${d.owner_team||""}${d.owner_dept?" / "+d.owner_dept:""}</div></td>
+    <td>${visTag(d.visibility)} ${clsTag(d.classification)}
+      <div class="muted">${d.owner_team||""}${d.owner_dept?" / "+d.owner_dept:""}</div></td>
     <td>
       <button class="small ghost" onclick="viewChunks(${d.id})">片段/授权</button>
       <button class="small danger" onclick="delDoc(${d.id})">删除</button>
@@ -218,33 +234,58 @@ async function viewChunks(docId) {
   const r = await api("GET", `/api/documents/${docId}/chunks`);
   const panel = document.getElementById("chunkPanel");
   if (r.status !== 200) { panel.innerHTML = "❌ " + r.data.error; return; }
-  panel.innerHTML = "<h2>片段列表（可单独绑定可见性 / 指定用户·角色·团队·部门）</h2>" +
+  panel.innerHTML = "<h2>片段列表（可见性 / 密级 / 时限 allow·deny）</h2>" +
     r.data.map(c => `<div class="src">
       <b>#${c.chunk_index+1}</b> ${c.heading_path ? "【"+c.heading_path+"】" : ""}
-      ${visTag(c.visibility)} <span class="score">${c.page_start ? "p."+c.page_start+" · " : ""}
+      ${visTag(c.visibility)} ${clsTag(c.classification)} <span class="score">${c.page_start ? "p."+c.page_start+" · " : ""}
       字符[${c.char_start},${c.char_end}) · id=${c.chunk_id}</span>
       <div>${escapeHtml(c.content)}…</div>
       <div style="margin-top:6px">
         <select id="vis_${c.chunk_id}">
-          <option value="">继承文档</option>
+          <option value="">可见性:继承</option>
           <option value="private">私有</option><option value="team">团队</option>
           <option value="department">部门</option><option value="public">租户公开</option>
         </select>
-        <button class="small" onclick="setVis(${c.chunk_id})">保存可见性</button>
+        <button class="small" onclick="setVis(${c.chunk_id})">存可见性</button>
+        <select id="cls_${c.chunk_id}">
+          <option value="">密级:继承</option>
+          <option value="internal">internal</option>
+          <option value="sensitive">sensitive</option>
+          <option value="secret">secret</option>
+        </select>
+        <button class="small" onclick="setCls(${c.chunk_id})">存密级</button>
+      </div>
+      <div style="margin-top:6px">
         <select id="gt_${c.chunk_id}">
           <option value="user">指定用户</option><option value="role">指定角色</option>
           <option value="team">指定团队</option><option value="department">指定部门</option>
         </select>
-        <input type="text" id="gv_${c.chunk_id}" placeholder="用户ID / 角色名 / 团队名 / 部门名"
-               style="width:260px;display:inline-block">
-        <button class="small ghost" onclick="addGrant(${c.chunk_id})">添加授权</button>
-        <button class="small ghost" onclick="viewSource(${c.document_id},${c.chunk_id})">查看溯源原文</button>
+        <input type="text" id="gv_${c.chunk_id}" placeholder="用户ID/角色/团队/部门"
+               style="width:200px;display:inline-block">
+        <select id="ge_${c.chunk_id}">
+          <option value="allow">allow 允许</option><option value="deny">deny 拒绝</option>
+        </select>
+        <input type="number" id="gttl_${c.chunk_id}" placeholder="有效期秒(空=长期)" min="1"
+               style="width:130px;display:inline-block">
+        <button class="small ghost" onclick="addGrant(${c.chunk_id})">添加规则</button>
+        <button class="small ghost" onclick="viewSource(${c.document_id},${c.chunk_id})">溯源原文</button>
       </div>
-      <div class="muted" id="grants_${c.chunk_id}">${(c.grants||[]).map(g =>
-        `<span class="tag">${g.subject_type}:${g.subject_value}
-        <a href="#" onclick="rmGrant(${c.chunk_id},${g.id});return false;" style="color:#a34a3c">✕</a></span> `).join("")}</div>
+      <div class="muted" id="grants_${c.chunk_id}">${(c.grants||[]).map(g => {
+        const exp = g.expires_at ? ` 至${new Date(g.expires_at*1000).toLocaleString()}` : " 长期";
+        const deny = g.effect === "deny";
+        return `<span class="tag" style="${deny?'background:#f3e9e7;color:#a34a3c':''}">` +
+          `${g.effect}:${g.subject_type}:${g.subject_value}${exp} ` +
+          `<a href="#" onclick="rmGrant(${c.chunk_id},${g.id});return false;" style="color:#a34a3c">✕</a></span> `;
+      }).join("")}</div>
     </div>`).join("");
   panel.scrollIntoView({behavior:"smooth"});
+}
+
+async function setCls(cid) {
+  const v = document.getElementById("cls_"+cid).value || null;
+  const r = await api("PUT", `/api/chunks/${cid}/classification`, { classification: v });
+  alert(r.data.error || r.data.message);
+  if (CURRENT_DOC_ID) viewChunks(CURRENT_DOC_ID);
 }
 
 async function setVis(cid) {
@@ -257,8 +298,12 @@ async function setVis(cid) {
 async function addGrant(cid) {
   const t = document.getElementById("gt_"+cid).value;
   const v = document.getElementById("gv_"+cid).value.trim();
-  if (!v) { alert("请填写授权对象"); return; }
-  const r = await api("POST", `/api/chunks/${cid}/grants`, { subject_type:t, subject_value:v });
+  const effect = document.getElementById("ge_"+cid).value;
+  const ttlRaw = document.getElementById("gttl_"+cid).value.trim();
+  if (!v) { alert("请填写规则对象"); return; }
+  const payload = { subject_type:t, subject_value:v, effect };
+  if (ttlRaw) payload.expires_in = Number(ttlRaw);
+  const r = await api("POST", `/api/chunks/${cid}/grants`, payload);
   if (r.data.error) { alert(r.data.error); return; }
   loadDocs();
   if (CURRENT_DOC_ID) viewChunks(CURRENT_DOC_ID);

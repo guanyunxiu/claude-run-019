@@ -29,6 +29,7 @@ class RequestContext:
             "tenant_role": u.get("tenant_role"),
             "team": u.get("team"),
             "department": u.get("department"),
+            "clearance": u.get("clearance") or "internal",
             "email": u.get("email"),
             "display_name": u.get("display_name"),
         }

@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS documents (
     char_count    INTEGER NOT NULL DEFAULT 0,
     full_text     TEXT NOT NULL DEFAULT '',       -- 清洗后的全文（片段溯源定位）
     visibility    TEXT NOT NULL DEFAULT 'private',  -- private/team/department/public
+    classification TEXT NOT NULL DEFAULT 'internal', -- 密级：internal/sensitive/secret
     owner_user_id INTEGER NOT NULL,
     owner_team    TEXT,
     owner_dept    TEXT,
@@ -42,19 +43,35 @@ CREATE TABLE IF NOT EXISTS chunks (
     page_start   INTEGER,
     page_end     INTEGER,
     visibility   TEXT,                            -- NULL=继承文档；可单独覆盖
+    classification TEXT,                          -- NULL=继承文档密级；可单独上调/下调
     index_version INTEGER NOT NULL DEFAULT 0,
     UNIQUE(document_id, chunk_index)
 );
 
--- 片段级附加授权（细粒度权限绑定：用户/角色/团队/部门）
+-- 片段级 ACL 规则（allow 授权 / deny 显式拒绝；支持有效期）
+-- 一个 (chunk, subject) 可同时存在 allow 与 deny；deny 永远优先。
 CREATE TABLE IF NOT EXISTS chunk_grants (
     id           INTEGER PRIMARY KEY,
     chunk_id     INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
     subject_type TEXT NOT NULL,                   -- user / role / team / department
     subject_value TEXT NOT NULL,
+    effect       TEXT NOT NULL DEFAULT 'allow',   -- allow / deny
+    expires_at   REAL,                            -- NULL=长期；unix 秒，过期即失效
     created_at   REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_chunk_grants_chunk ON chunk_grants(chunk_id);
+
+-- 文档级 ACL 规则（对文档的全部片段生效；典型用途：对某人/某团队整体 deny）
+CREATE TABLE IF NOT EXISTS document_rules (
+    id            INTEGER PRIMARY KEY,
+    document_id   INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    subject_type  TEXT NOT NULL,                  -- user / role / team / department
+    subject_value TEXT NOT NULL,
+    effect        TEXT NOT NULL DEFAULT 'allow',  -- allow / deny
+    expires_at    REAL,                           -- NULL=长期
+    created_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_document_rules_doc ON document_rules(document_id);
 
 CREATE TABLE IF NOT EXISTS query_logs (
     id          INTEGER PRIMARY KEY,
@@ -64,6 +81,24 @@ CREATE TABLE IF NOT EXISTS query_logs (
     created_at  REAL NOT NULL
 );
 """
+
+# 增量迁移：对旧库补齐新列/新表
+_COLUMN_MIGRATIONS = {
+    "documents": [("classification", "TEXT NOT NULL DEFAULT 'internal'")],
+    "chunks": [("classification", "TEXT")],
+    "chunk_grants": [("effect", "TEXT NOT NULL DEFAULT 'allow'"),
+                     ("expires_at", "REAL")],
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    conn.executescript(_SCHEMA)
+    for table, columns in _COLUMN_MIGRATIONS.items():
+        existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, decl in columns:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
 
 
 def db_path_for(tenant_slug: str) -> Path:
@@ -88,9 +123,8 @@ def connect(tenant_slug: str, tenant_id: int) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path_for(tenant_slug), timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.executescript(_SCHEMA)
-    # tenant_id 一致性闸门：建库后所有业务写入都必须带本租户 id
-    conn.execute("PRAGMA user_version")
+    _migrate(conn)
+    conn.commit()
     return conn
 
 
@@ -98,15 +132,18 @@ def connect(tenant_slug: str, tenant_id: int) -> sqlite3.Connection:
 
 def create_document(conn, *, tenant_id: int, title: str, source_name: str, file_type: str,
                     blob_path: str, full_text: str, visibility: str,
-                    owner_user_id: int, owner_team: str | None, owner_dept: str | None) -> int:
+                    owner_user_id: int, owner_team: str | None, owner_dept: str | None,
+                    classification: str = "internal") -> int:
     now = time.time()
     cur = conn.execute(
         """INSERT INTO documents(tenant_id, title, source_name, file_type, blob_path,
-               char_count, full_text, visibility, owner_user_id, owner_team, owner_dept,
+               char_count, full_text, visibility, classification,
+               owner_user_id, owner_team, owner_dept,
                status, index_version, created_at, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?, 'ready', 1, ?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'ready', 1, ?,?)""",
         (tenant_id, title, source_name, file_type, blob_path, len(full_text), full_text,
-         visibility, owner_user_id, owner_team, owner_dept, now, now),
+         visibility, classification,
+         owner_user_id, owner_team, owner_dept, now, now),
     )
     return int(cur.lastrowid)
 
@@ -150,13 +187,14 @@ def delete_document(conn, document_id: int, tenant_id: int) -> str | None:
 def insert_chunk(conn, *, document_id: int, chunk_index: int, heading_path: str | None,
                  content: str, char_start: int, char_end: int,
                  page_start: int | None, page_end: int | None,
-                 visibility: str | None) -> int:
+                 visibility: str | None, classification: str | None = None) -> int:
     cur = conn.execute(
         """INSERT INTO chunks(document_id, chunk_index, heading_path, content,
-               char_start, char_end, page_start, page_end, visibility, index_version)
-           VALUES (?,?,?,?,?,?,?,?,?,1)""",
+               char_start, char_end, page_start, page_end, visibility, classification,
+               index_version)
+           VALUES (?,?,?,?,?,?,?,?,?,?,1)""",
         (document_id, chunk_index, heading_path, content, char_start, char_end,
-         page_start, page_end, visibility),
+         page_start, page_end, visibility, classification),
     )
     return int(cur.lastrowid)
 
@@ -171,18 +209,29 @@ def set_chunk_visibility(conn, chunk_id: int, visibility: str | None) -> None:
     conn.execute("UPDATE chunks SET visibility=? WHERE id=?", (visibility, chunk_id))
 
 
-def add_grant(conn, chunk_id: int, subject_type: str, subject_value: str) -> int:
+def set_chunk_classification(conn, chunk_id: int, classification: str | None) -> None:
+    conn.execute("UPDATE chunks SET classification=? WHERE id=?", (classification, chunk_id))
+
+
+def set_document_classification(conn, document_id: int, classification: str) -> None:
+    conn.execute("UPDATE documents SET classification=? WHERE id=?",
+                 (classification, document_id))
+
+
+def add_grant(conn, chunk_id: int, subject_type: str, subject_value: str,
+              effect: str = "allow", expires_at: float | None = None) -> int:
     cur = conn.execute(
-        "INSERT INTO chunk_grants(chunk_id, subject_type, subject_value, created_at)"
-        " VALUES (?,?,?,?)",
-        (chunk_id, subject_type, subject_value, time.time()),
+        "INSERT INTO chunk_grants(chunk_id, subject_type, subject_value, effect,"
+        " expires_at, created_at) VALUES (?,?,?,?,?,?)",
+        (chunk_id, subject_type, subject_value, effect, expires_at, time.time()),
     )
     return int(cur.lastrowid)
 
 
 def list_grants(conn, chunk_id: int):
     return conn.execute(
-        "SELECT id, subject_type, subject_value FROM chunk_grants WHERE chunk_id=? ORDER BY id",
+        "SELECT id, subject_type, subject_value, effect, expires_at"
+        " FROM chunk_grants WHERE chunk_id=? ORDER BY id",
         (chunk_id,),
     ).fetchall()
 
@@ -190,6 +239,33 @@ def list_grants(conn, chunk_id: int):
 def delete_grant(conn, grant_id: int, chunk_id: int) -> bool:
     cur = conn.execute(
         "DELETE FROM chunk_grants WHERE id=? AND chunk_id=?", (grant_id, chunk_id)
+    )
+    return cur.rowcount > 0
+
+
+# ---------------- 文档级规则（allow / deny，可时限） ----------------
+
+def add_document_rule(conn, document_id: int, subject_type: str, subject_value: str,
+                      effect: str = "deny", expires_at: float | None = None) -> int:
+    cur = conn.execute(
+        "INSERT INTO document_rules(document_id, subject_type, subject_value, effect,"
+        " expires_at, created_at) VALUES (?,?,?,?,?,?)",
+        (document_id, subject_type, subject_value, effect, expires_at, time.time()),
+    )
+    return int(cur.lastrowid)
+
+
+def list_document_rules(conn, document_id: int):
+    return conn.execute(
+        "SELECT id, subject_type, subject_value, effect, expires_at"
+        " FROM document_rules WHERE document_id=? ORDER BY id",
+        (document_id,),
+    ).fetchall()
+
+
+def delete_document_rule(conn, rule_id: int, document_id: int) -> bool:
+    cur = conn.execute(
+        "DELETE FROM document_rules WHERE id=? AND document_id=?", (rule_id, document_id)
     )
     return cur.rowcount > 0
 

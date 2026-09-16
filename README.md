@@ -24,13 +24,16 @@ python3 run.py --host 0.0.0.0 --port 8080
 
 演示账号（密码均为 `demo123`）：
 
-| 账号 | 租户 | 角色 | 团队 / 部门 |
-|---|---|---|---|
-| alice@lab.cn | biolab 生物实验室 | 租户管理员 | 分子生物学团队 / 研发部 |
-| bob@lab.cn | biolab | 成员 | 分子生物学团队 / 研发部 |
-| carol@lab.cn | biolab | 成员 | 细胞生物学团队 / 研发部 |
-| dave@lab.cn | biolab | 成员 | 基因治疗团队 / 临床部 |
-| erin@chem.cn | chemmat 化学材料中心 | 租户管理员 | 催化团队 / 材料部 |
+| 账号 | 租户 | 角色 | 团队 / 部门 | clearance |
+|---|---|---|---|---|
+| alice@lab.cn | biolab 生物实验室 | 租户管理员 | 分子生物学团队 / 研发部 | secret |
+| bob@lab.cn | biolab | 成员 | 分子生物学团队 / 研发部 | sensitive |
+| carol@lab.cn | biolab | 成员 | 细胞生物学团队 / 研发部 | sensitive |
+| dave@lab.cn | biolab | 成员 | 基因治疗团队 / 临床部 | internal |
+| erin@chem.cn | chemmat 化学材料中心 | 租户管理员 | 催化团队 / 材料部 | secret |
+
+seed 另含《新一代载体临床申报机密实验方案》（secret，含一个被覆盖为 public 但密级仍
+secret 的片段），用于验证 clearance 不足时 public/team 也无法绕过密级闸门。
 
 > 生产首次部署：先注册账号，再用平台管理员接口 `POST /api/admin/tenants` 建租户、
 > `POST /api/admin/members` 把用户加入租户（平台管理员标志位 `users.is_platform_admin`）。
@@ -82,11 +85,48 @@ python3 tests/test_api.py
 - 接口：`PUT /api/chunks/{id}/visibility`、`POST /api/chunks/{id}/grants`、
   `DELETE /api/chunks/{id}/grants/{gid}`。
 
+#### 三维权限：时限授权 + 显式 deny + 密级 clearance
+
+在「有授权就能看」之上，有效权限统一为：
+
+```
+可访问 = 基础可见性(或有效 allow 授权)
+         ∧ 用户 clearance ≥ 片段有效密级
+         ∧ ¬命中 deny（片段级或文档级，且 deny 未过期）
+         ∧ 命中的 allow 未过期
+```
+
+- **密级 classification**：`internal(0) < sensitive(1) < secret(2)`。文档与片段
+  都有密级，片段密级为 NULL 时继承文档；成员在租户内有 `clearance`（存 tenant_users，
+  默认 internal）。**密级闸门独立于可见性——把 secret 片段覆盖为 public，clearance
+  不足者在列表/检索/问答/溯源仍然拿不到**，杜绝「public 覆盖绕过密级」。
+- **显式拒绝 effect=deny**：`chunk_grants` 与文档级 `document_rules` 均支持
+  `allow`/`deny`，deny 永远优先于 allow 与 public/team 可见性；文档级 deny 对整篇
+  文档全部片段生效（列表也不出现）。
+- **时限授权**：规则带 `expires_at`（或创建时传相对秒数 `expires_in`），过期后
+  立即从可访问白名单消失，无需删除规则；deny 过期同样自动解除。
+- **管理员旁路**：租户 `admin` 旁路密级/deny/时限，对本租户全部内容可读可管（审计运维），
+  但旁路**仅限租户内**——跨租户仍由独立库文件硬隔离，谓词始终绑定 `tenant_id`。
+- 列表/检索/问答/溯源四个出口共用同一谓词（`accessible_chunks_where` 与
+  `accessible_document_where`），保证语义一致：**文档可见当且仅当至少存在一个可访问片段**，
+  因此不会出现“列表/详情 200 但检索为 0、片段列表为空”的空壳文档——public/team 文档
+  若全部片段被 deny（或密级全部不足），列表与详情同样不返回；能进入文档就至少能看到一个片段。
+- 任何密级/规则/授权变更都 `bump_document_version`，BM25 白名单按请求实时计算、即时生效。
+- 接口：
+  - 成员密级：`PUT /api/admin/members/{uid}/clearance`，加成员时可传 `clearance`；
+  - 文档密级：`PUT /api/documents/{id}/classification`（上传可带 `classification`）；
+  - 片段密级：`PUT /api/chunks/{cid}/classification`；
+  - 片段规则：`POST /api/chunks/{cid}/grants`，body 支持
+    `{subject_type, subject_value, effect:"allow|deny", expires_in?:秒, expires_at?}`；
+  - 文档规则：`GET/POST /api/documents/{id}/rules`、
+    `DELETE /api/documents/{id}/rules/{rid}`。
+
 ### 4. 权限穿透式检索
 - 检索分三步，权限永远先于内容展示：
-  1. 依据登录身份生成「**可访问片段白名单 SQL 谓词**」（文档/片段可见性 + 4 类授权主体）；
+  1. 依据登录身份生成「**可访问片段白名单 SQL 谓词**」（可见性 + 密级闸门 +
+     deny 排除 + 时限/allow）；
   2. 仅对白名单片段累计 **BM25 分数**（中文单字 + 双字组 bigram、英文/数字按词），
-     越权片段分数恒为 0，**物理上无法进入结果**；
+     越权/密级不足/被拒/过期片段分数恒为 0，**物理上无法进入结果**；
   3. 回取数据时**再次叠加权限谓词**（纵深防御）。
 - 中文分词区分强词元（双字组/英文词）与弱词元（单字兜底），避免“率”误命中“转化率”。
 - 接口：`POST /api/search`。
@@ -108,7 +148,9 @@ python3 tests/test_api.py
   `mode="extractive"`、`degraded=true`，前端明确提示“已配置 LLM 但调用失败，已自动降级”，
   不会误显示为“LLM 生成”。
 - 每条回答附 `sources`：**原文文档名、源文件名、章节路径、片段序号、页码、字符区间、BM25 分**；
-  溯源接口 `GET /api/documents/{id}/chunks/{cid}/source` 返回片段精确原文与前后文。
+  溯源接口 `GET /api/documents/{id}/chunks/{cid}/source` 返回片段精确原文与前后文，
+  **前后文窗口按相邻片段的 ACL/密级/deny/时限逐条裁切**：窗口不得滑入相邻无权片段
+  （含其章节标题），返回 `context_clipped/clipped_side` 标记是否发生裁切；管理员旁路不裁切。
 
 ---
 
@@ -121,14 +163,17 @@ python3 tests/test_api.py
 | POST `/api/auth/logout` / GET `/api/me` | 会话 | 登录 |
 | GET `/api/tenants` | 租户列表（供选择登录上下文） | 公开 |
 | POST `/api/admin/tenants` | 创建租户 | 平台管理员 |
-| GET/POST `/api/admin/members` | 租户成员管理 | 租户管理员 |
+| GET/POST `/api/admin/members` | 成员管理（POST 可带 `clearance`） | 租户管理员 |
+| PUT `/api/admin/members/{uid}/clearance` | 调整成员密级许可 | 租户管理员 |
 | DELETE `/api/admin/members/{user_id}` | 移出租户（**立即删除该租户下其全部会话**，旧令牌即时失效） | 租户管理员 |
-| POST `/api/documents` | 上传（multipart：file/title/visibility/owner_team/owner_dept） | 登录（须为本租户成员） |
-| GET `/api/documents` · `/{id}` · DELETE `/{id}` | 列表/详情按**读权限** ACL 过滤；删除需管理权 | 登录 |
-| GET `/api/documents/{id}/chunks` | 片段+授权（管理者看全量，成员只看可见） | 登录 |
+| POST `/api/documents` | 上传（multipart：file/title/visibility/classification/owner_team/owner_dept） | 登录（须为本租户成员） |
+| GET `/api/documents` · `/{id}` · DELETE `/{id}` | 列表/详情按**读权限+密级+deny** 过滤；删除需管理权 | 登录 |
+| GET `/api/documents/{id}/chunks` | 片段+规则（管理者看全量，成员只看可访问片段） | 登录 |
 | GET `/api/documents/{id}/chunks/{cid}/source` | 片段溯源原文定位 | 登录（受权） |
-| PUT `/api/chunks/{cid}/visibility` | 设置片段可见性（null=继承） | 所有者/管理员 |
-| POST/DELETE `/api/chunks/{cid}/grants[/{gid}]` | 片段授权管理 | 所有者/管理员 |
+| PUT `/api/chunks/{cid}/visibility` · `/classification` | 设置片段可见性/密级（null=继承） | 所有者/管理员 |
+| POST/DELETE `/api/chunks/{cid}/grants[/{gid}]` | 片段 allow/deny 规则（可带 `expires_in/expires_at`） | 所有者/管理员 |
+| PUT `/api/documents/{id}/classification` | 设置文档密级 | 所有者/管理员 |
+| GET/POST/DELETE `/api/documents/{id}/rules[/{rid}]` | 文档级 allow/deny 规则（整篇生效） | 所有者/管理员 |
 | POST `/api/search` | 权限穿透检索 | 登录 |
 | POST `/api/ask` | 问答 + 溯源 | 登录 |
 

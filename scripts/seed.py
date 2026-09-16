@@ -103,6 +103,28 @@ DEPT_REVIEW = """研发部 2026 年度科研综述
 部门计划建设统一的载体中试平台，并推动两个候选项目进入新药临床试验申报阶段。
 """
 
+# 机密实验方案：整体 team 可见但密级 secret；其中“通用安全须知”片段被覆盖为 public，
+# 但密级仍为 secret，用于验证 clearance 不足时 public/team 都无法绕过密级闸门。
+SECRET_PLAN = """新一代载体临床申报机密实验方案
+
+1 方案概述
+本方案涉及新一代肝靶向载体的临床前关键数据，密级为机密（secret）。
+载体中试工艺参数、冻干配方与临床批次放行标准均属于核心机密，仅 secret clearance 人员可读。
+
+2 通用安全须知
+本实验涉及生物安全二级操作，所有进入洁净区的人员须穿戴三级防护并完成生物安全培训。
+本条虽标记为租户公开，但密级仍为机密：clearance 不足者即便看到条目也无权读取其内容。
+
+3 机密工艺参数
+中试放大采用 200 升一次性反应袋，关键工艺参数：有机相流速 12 毫升每分钟、
+水相流速 48 毫升每分钟、剪切转速 6000 转每分钟，包封率稳定在 90% 以上。
+冻干保护剂采用 8% 海藻糖加 0.5% 组氨酸缓冲体系，复溶粒径变化小于 3%。
+
+4 临床批次放行标准
+关键质量属性包括粒径 80 至 100 纳米、PDI 小于 0.15、内毒素低于 0.5 EU/mL、
+无菌检查合格、效价标示量 95% 至 105%。任一指标不合格即拒绝放行。
+"""
+
 CHEM_LOG = """催化剂筛选实验日志（化学材料租户）
 
 1 实验目的
@@ -151,11 +173,12 @@ def seed_demo():
     biolab = _ensure_tenant(gconn, "biolab", "生物实验室", "alice@lab.cn")
     chemmat = _ensure_tenant(gconn, "chemmat", "化学材料中心", "erin@chem.cn")
     # 管理员同样需要团队/部门归属，否则其上传的「团队/部门公开」文档无人可见
-    db_global.add_tenant_member(gconn, biolab, alice, "admin", "分子生物学团队", "研发部")
-    db_global.add_tenant_member(gconn, biolab, bob, "member", "分子生物学团队", "研发部")
-    db_global.add_tenant_member(gconn, biolab, carol, "member", "细胞生物学团队", "研发部")
-    db_global.add_tenant_member(gconn, biolab, dave, "member", "基因治疗团队", "临床部")
-    db_global.add_tenant_member(gconn, chemmat, erin, "admin", "催化团队", "材料部")
+    # clearance：Alice=secret（可看机密）；Bob/Carol=sensitive；Dave=internal
+    db_global.add_tenant_member(gconn, biolab, alice, "admin", "分子生物学团队", "研发部", "secret")
+    db_global.add_tenant_member(gconn, biolab, bob, "member", "分子生物学团队", "研发部", "sensitive")
+    db_global.add_tenant_member(gconn, biolab, carol, "member", "细胞生物学团队", "研发部", "sensitive")
+    db_global.add_tenant_member(gconn, biolab, dave, "member", "基因治疗团队", "临床部", "internal")
+    db_global.add_tenant_member(gconn, chemmat, erin, "admin", "催化团队", "材料部", "secret")
     gconn.commit()
 
     # ---- biolab 文档 ----
@@ -195,6 +218,28 @@ def seed_demo():
         visibility="department", owner_team="分子生物学团队", owner_dept="研发部",
     )
     print("文档3:", doc3["title"], "片段数:", doc3["chunk_count"])
+
+    # 文档5：机密（secret）实验方案，team 可见；其中「通用安全须知」片段覆盖为 public，
+    # 但密级仍为 secret —— clearance 不足的 Bob/Carol/Dave 在列表/检索/问答/溯源都拿不到。
+    doc5 = ingest_upload(
+        tconn=tconn, tenant_id=biolab, tenant_slug="biolab",
+        owner_user_id=alice, filename="机密载体临床申报实验方案.txt",
+        content=SECRET_PLAN.encode("utf-8"), title="新一代载体临床申报机密实验方案",
+        visibility="team", owner_team="分子生物学团队", owner_dept="研发部",
+        classification="secret",
+    )
+    print("文档5:", doc5["title"], "片段数:", doc5["chunk_count"], "(密级 secret)")
+    notice = tconn.execute(
+        "SELECT id FROM chunks WHERE document_id=? AND heading_path LIKE '%通用安全须知%'",
+        (doc5["document_id"],),
+    ).fetchall()
+    for c in notice:
+        # 覆盖为 public，但密级显式保持 secret：演示 public 绕不过密级
+        db_tenant.set_chunk_visibility(tconn, c["id"], "public")
+        db_tenant.set_chunk_classification(tconn, c["id"], "secret")
+        print(f"  片段 {c['id']} 覆盖为 public 但密级 secret（clearance 不足仍不可见）")
+    db_tenant.bump_document_version(tconn, doc5["document_id"])
+    tconn.commit()
     tconn.close()
 
     # ---- chemmat 文档（验证跨租户隔离：biolab 任何人都搜不到） ----
