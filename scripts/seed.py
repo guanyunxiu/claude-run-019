@@ -146,16 +146,33 @@ def _ensure_user(gconn, email, name, password=PASSWORD):
 
 
 def _ensure_tenant(gconn, slug, name, admin_email=None):
+    """创建租户（如不存在）。成员关系统一由 seed_demo 中带审计的 upsert 建立，
+    避免管理员加入绕过 member.add 审计。"""
     tenant = db_global.get_tenant_by_slug(gconn, slug)
     if tenant is None:
         tid = db_global.create_tenant(gconn, slug, name)
         db_tenant.connect(slug, tid).close()
     else:
         tid = tenant["id"]
-    if admin_email:
-        admin = db_global.get_user_by_email(gconn, admin_email)
-        db_global.add_tenant_member(gconn, tid, admin["id"], "admin")
     return tid
+
+
+def _system_actor(uid):
+    """seed 写审计时使用的操作者身份（标记为系统初始化，以实际属主 uid 落 actor）。"""
+    return {"user_id": uid, "email": "system@seed.local",
+            "display_name": "系统初始化", "ip": None}
+
+
+def _audit_member_add(tconn, tenant_id, actor_uid, user, role, team, dept, clearance):
+    """与 POST /api/admin/members 一致的成员加入审计。"""
+    db_tenant.append_audit(
+        tconn, tenant_id=tenant_id, actor_id=actor_uid,
+        actor_name="系统初始化", actor_email="system@seed.local",
+        action="member.add", object_type="member", object_id=user["id"],
+        summary=f"初始化成员 {user['display_name']}（{user['email']}）加入租户，"
+                f"角色 {role}，密级 {clearance}",
+        after={"user_id": user["id"], "email": user["email"], "role": role,
+               "team": team, "department": dept, "clearance": clearance})
 
 
 def seed_demo():
@@ -174,20 +191,30 @@ def seed_demo():
     chemmat = _ensure_tenant(gconn, "chemmat", "化学材料中心", "erin@chem.cn")
     # 管理员同样需要团队/部门归属，否则其上传的「团队/部门公开」文档无人可见
     # clearance：Alice=secret（可看机密）；Bob/Carol=sensitive；Dave=internal
-    db_global.add_tenant_member(gconn, biolab, alice, "admin", "分子生物学团队", "研发部", "secret")
-    db_global.add_tenant_member(gconn, biolab, bob, "member", "分子生物学团队", "研发部", "sensitive")
-    db_global.add_tenant_member(gconn, biolab, carol, "member", "细胞生物学团队", "研发部", "sensitive")
-    db_global.add_tenant_member(gconn, biolab, dave, "member", "基因治疗团队", "临床部", "internal")
-    db_global.add_tenant_member(gconn, chemmat, erin, "admin", "催化团队", "材料部", "secret")
+    # 用 upsert（幂等）并由各自租户库记录 member.add 审计，与正式 API 路径一致
+    members_bio = [
+        (alice, "admin", "分子生物学团队", "研发部", "secret"),
+        (bob, "member", "分子生物学团队", "研发部", "sensitive"),
+        (carol, "member", "细胞生物学团队", "研发部", "sensitive"),
+        (dave, "member", "基因治疗团队", "临床部", "internal"),
+    ]
     gconn.commit()
 
     # ---- biolab 文档 ----
     tconn = db_tenant.connect("biolab", biolab)
+    bio_users = {uid: db_global.get_user(gconn, uid) for uid, *_ in members_bio}
+    for uid, role, team, dept, clr in members_bio:
+        is_new, _ = db_global.upsert_tenant_member(gconn, biolab, uid, role, team, dept, clr)
+        if is_new:
+            _audit_member_add(tconn, biolab, alice, bio_users[uid], role, team, dept, clr)
+    gconn.commit()
+
     doc1 = ingest_upload(
         tconn=tconn, tenant_id=biolab, tenant_slug="biolab",
         owner_user_id=alice, filename="纳米颗粒递送研究报告.txt",
         content=NANO_REPORT.encode("utf-8"), title="新型纳米颗粒递送系统研究报告",
         visibility="team", owner_team="分子生物学团队", owner_dept="研发部",
+        actor=_system_actor(alice),
     )
     print("文档1:", doc1["title"], "片段数:", doc1["chunk_count"])
 
@@ -196,6 +223,7 @@ def seed_demo():
         owner_user_id=alice, filename="CRISPR实验记录-2026Q1.txt",
         content=CRISPR_LOG.encode("utf-8"), title="CRISPR 实验记录-2026Q1",
         visibility="private", owner_team="分子生物学团队", owner_dept="研发部",
+        actor=_system_actor(alice),
     )
     print("文档2:", doc2["title"], "片段数:", doc2["chunk_count"])
 
@@ -206,7 +234,15 @@ def seed_demo():
         (doc2["document_id"],),
     ).fetchall()
     for c in secret_chunks:
-        db_tenant.add_grant(tconn, c["id"], "user", str(bob))
+        gid = db_tenant.add_grant(tconn, c["id"], "user", str(bob))
+        db_tenant.append_audit(
+            tconn, tenant_id=biolab, actor_id=alice,
+            actor_name="系统初始化", actor_email="system@seed.local",
+            action="grant.add", object_type="grant", object_id=gid,
+            document_id=doc2["document_id"],
+            summary=f"初始化授权：片段#{c['id']} 允许 user={bob}（鲍勃）",
+            after={"grant_id": gid, "chunk_id": c["id"], "subject_type": "user",
+                   "subject_value": str(bob), "effect": "allow", "expires_at": None})
         print(f"  片段授权: chunk {c['id']} -> user:bob")
     db_tenant.bump_document_version(tconn, doc2["document_id"])
     tconn.commit()
@@ -216,6 +252,7 @@ def seed_demo():
         owner_user_id=alice, filename="研发部年度科研综述.txt",
         content=DEPT_REVIEW.encode("utf-8"), title="研发部年度科研综述",
         visibility="department", owner_team="分子生物学团队", owner_dept="研发部",
+        actor=_system_actor(alice),
     )
     print("文档3:", doc3["title"], "片段数:", doc3["chunk_count"])
 
@@ -226,17 +263,32 @@ def seed_demo():
         owner_user_id=alice, filename="机密载体临床申报实验方案.txt",
         content=SECRET_PLAN.encode("utf-8"), title="新一代载体临床申报机密实验方案",
         visibility="team", owner_team="分子生物学团队", owner_dept="研发部",
-        classification="secret",
+        classification="secret", actor=_system_actor(alice),
     )
     print("文档5:", doc5["title"], "片段数:", doc5["chunk_count"], "(密级 secret)")
     notice = tconn.execute(
-        "SELECT id FROM chunks WHERE document_id=? AND heading_path LIKE '%通用安全须知%'",
+        "SELECT id, chunk_index FROM chunks WHERE document_id=? "
+        "AND heading_path LIKE '%通用安全须知%'",
         (doc5["document_id"],),
     ).fetchall()
     for c in notice:
         # 覆盖为 public，但密级显式保持 secret：演示 public 绕不过密级
         db_tenant.set_chunk_visibility(tconn, c["id"], "public")
         db_tenant.set_chunk_classification(tconn, c["id"], "secret")
+        db_tenant.append_audit(
+            tconn, tenant_id=biolab, actor_id=alice,
+            actor_name="系统初始化", actor_email="system@seed.local",
+            action="chunk.visibility_update", object_type="chunk", object_id=c["id"],
+            document_id=doc5["document_id"],
+            summary=f"初始化片段#{c['chunk_index']+1}可见性：继承 → public（密级保持 secret）",
+            before={"visibility": None}, after={"visibility": "public"})
+        db_tenant.append_audit(
+            tconn, tenant_id=biolab, actor_id=alice,
+            actor_name="系统初始化", actor_email="system@seed.local",
+            action="chunk.classification_update", object_type="chunk", object_id=c["id"],
+            document_id=doc5["document_id"],
+            summary=f"初始化片段#{c['chunk_index']+1}密级：继承 → secret",
+            before={"classification": None}, after={"classification": "secret"})
         print(f"  片段 {c['id']} 覆盖为 public 但密级 secret（clearance 不足仍不可见）")
     db_tenant.bump_document_version(tconn, doc5["document_id"])
     tconn.commit()
@@ -244,13 +296,21 @@ def seed_demo():
 
     # ---- chemmat 文档（验证跨租户隔离：biolab 任何人都搜不到） ----
     tconn2 = db_tenant.connect("chemmat", chemmat)
-    doc4 = ingest_upload(
+    erin_user = db_global.get_user(gconn, erin)
+    is_new, _ = db_global.upsert_tenant_member(
+        gconn, chemmat, erin, "admin", "催化团队", "材料部", "secret")
+    if is_new:
+        _audit_member_add(tconn2, chemmat, erin, erin_user, "admin", "催化团队", "材料部", "secret")
+    gconn.commit()
+    ingest_upload(
         tconn=tconn2, tenant_id=chemmat, tenant_slug="chemmat",
         owner_user_id=erin, filename="催化剂筛选实验日志.txt",
         content=CHEM_LOG.encode("utf-8"), title="催化剂筛选实验日志",
         visibility="team", owner_team="催化团队", owner_dept="材料部",
+        actor=_system_actor(erin),
     )
-    print("文档4:", doc4["title"], "片段数:", doc4["chunk_count"], "(租户 chemmat)")
+    print("文档4: 催化剂筛选实验日志 片段数见上 (租户 chemmat)")
+    tconn2.commit()
     tconn2.close()
     gconn.close()
     print("\n演示数据初始化完成。")

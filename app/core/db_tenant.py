@@ -389,7 +389,9 @@ def query_audit(conn, tenant_id: int, *, start: float | None = None,
     if action:
         where.append("action = ?")
         params.append(action)
-    limit = max(1, min(int(limit), 2000))
+    # 底层只做安全硬上限（10000），防止无界拉取；普通查询/导出的细分上限
+    # 由调用方（API 层 _audit_filters）分别控制为 2000 / 10000。
+    limit = max(1, min(int(limit), 10000))
     offset = max(0, int(offset))
     return conn.execute(
         f"""SELECT * FROM audit_log WHERE {' AND '.join(where)}

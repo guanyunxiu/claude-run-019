@@ -286,12 +286,29 @@ def create_tenant(h, ctx):
         raise ApiError(409, "租户标识已存在")
     tid = db_global.create_tenant(ctx.gconn, slug, name)
     # 惰性初始化租户库（独立文件）
-    db_tenant.connect(slug, tid).close()
-    # 创建者自动成为租户管理员（如指定）
-    if data.get("admin_email"):
-        admin = db_global.get_user_by_email(ctx.gconn, data["admin_email"].strip().lower())
-        if admin:
-            db_global.add_tenant_member(ctx.gconn, tid, admin["id"], "admin")
+    tconn = db_tenant.connect(slug, tid)
+    try:
+        # 创建者自动成为租户管理员（如指定）；与正式成员路径一致地写审计
+        if data.get("admin_email"):
+            admin = db_global.get_user_by_email(
+                ctx.gconn, data["admin_email"].strip().lower())
+            if admin:
+                is_new, _ = db_global.upsert_tenant_member(
+                    ctx.gconn, tid, admin["id"], "admin")
+                if is_new:
+                    db_tenant.append_audit(
+                        tconn, tenant_id=tid, actor_id=ctx.user["user_id"],
+                        actor_name=ctx.user.get("display_name"),
+                        actor_email=ctx.user.get("email"),
+                        action="member.add", object_type="member", object_id=admin["id"],
+                        summary=f"建租户时指定管理员：{admin['display_name']}"
+                                f"（{admin['email']}）加入租户，角色 admin",
+                        after={"user_id": admin["id"], "email": admin["email"],
+                               "role": "admin", "clearance": "internal"},
+                        ip=getattr(ctx, "ip", None))
+        tconn.commit()
+    finally:
+        tconn.close()
     return {"tenant_id": tid, "slug": slug, "name": name}
 
 
@@ -862,15 +879,22 @@ def _require_tenant_admin(ctx):
         raise ApiError(403, "仅租户管理员可查看审计")
 
 
-def _audit_filters(query: dict):
-    import time as _time
+AUDIT_QUERY_DEFAULT_LIMIT = 200
+AUDIT_QUERY_MAX_LIMIT = 2000
+AUDIT_EXPORT_DEFAULT_LIMIT = 10000
+AUDIT_EXPORT_MAX_LIMIT = 10000
+
+
+def _audit_filters(query: dict, *, default_limit: int, max_limit: int):
     filters = {}
     try:
         filters["start"] = float(query["start"]) if query.get("start") else None
         filters["end"] = float(query["end"]) if query.get("end") else None
         filters["actor_id"] = int(query["actor_id"]) if query.get("actor_id") else None
         filters["document_id"] = int(query["document_id"]) if query.get("document_id") else None
-        filters["limit"] = min(int(query.get("limit") or 200), 2000)
+        # 不带 limit 时取该场景默认值；带了就按值，但封顶到该场景上限
+        raw_limit = query.get("limit")
+        filters["limit"] = min(int(raw_limit) if raw_limit else default_limit, max_limit)
         filters["offset"] = max(int(query.get("offset") or 0), 0)
     except (TypeError, ValueError):
         raise ApiError(400, "审计过滤参数非法")
@@ -884,26 +908,30 @@ def get_audit(h, ctx):
     _require_tenant_admin(ctx)
     from urllib.parse import parse_qs
     q = {k: v[0] for k, v in parse_qs(urlparse(h.path).query).items()}
-    f = _audit_filters(q)
+    f = _audit_filters(q, default_limit=AUDIT_QUERY_DEFAULT_LIMIT,
+                       max_limit=AUDIT_QUERY_MAX_LIMIT)
     rows = db_tenant.query_audit(
         ctx.tconn, ctx.user["tenant_id"], start=f["start"], end=f["end"],
         actor_id=f["actor_id"], document_id=f["document_id"], action=f["action"],
         limit=f["limit"], offset=f["offset"],
     )
-    return {"count": len(rows), "results": [_audit_row(r) for r in rows]}
+    return {"count": len(rows), "limit": f["limit"],
+            "results": [_audit_row(r) for r in rows]}
 
 
 @Handler.route("GET", "/api/audit/export")
 def export_audit(h, ctx):
-    """导出当前租户审计为 CSV（同样仅管理员、同样租户闸门）。"""
+    """导出当前租户审计为 CSV（同样仅管理员、同样租户闸门）。
+
+    导出使用独立的更高上限（默认/上限 10000），不受普通查询 200/2000 的限制。
+    """
     import csv
     import io
     _require_tenant_admin(ctx)
     from urllib.parse import parse_qs
     q = {k: v[0] for k, v in parse_qs(urlparse(h.path).query).items()}
-    f = _audit_filters(q)
-    # 导出上限更高，但仍封顶，防止一次拉取全库
-    f["limit"] = min(f.get("limit", 2000) if f.get("limit") else 2000, 10000)
+    f = _audit_filters(q, default_limit=AUDIT_EXPORT_DEFAULT_LIMIT,
+                       max_limit=AUDIT_EXPORT_MAX_LIMIT)
     rows = db_tenant.query_audit(
         ctx.tconn, ctx.user["tenant_id"], start=f["start"], end=f["end"],
         actor_id=f["actor_id"], document_id=f["document_id"], action=f["action"],

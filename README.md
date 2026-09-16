@@ -201,8 +201,14 @@ python3 tests/test_api.py
 - 访问控制：仅**本租户管理员**可查/导出，普通成员调用返回 403、匿名 401；查询强制带
   `tenant_id` 闸门，审计存于各租户独立库，**别的租户审计完全看不到**。
 - 全局库操作（成员密级/踢人/加成员）也会把审计冗余写入对应租户库，保证单租户审计完整。
-- `GET /api/audit?document_id=&actor_id=&action=&start=&end=` 返回 JSON；
-  `GET /api/audit/export?...` 返回带 BOM 的 UTF-8 CSV（Excel 可直接打开）。
+- `GET /api/audit?document_id=&actor_id=&action=&start=&end=&limit=&offset=` 返回 JSON：
+  普通查询默认 200 条、硬上限 2000；`GET /api/audit/export?...` 返回带 BOM 的 UTF-8 CSV
+ （Excel 可直接打开），**导出使用独立的更高上限：默认 10000、硬上限 10000**，
+  不受普通查询 200/2000 的限制。
+- **写路径一致**：`scripts/seed.py` 与建租户接口走与正式 API 相同的审计写入——seed 的
+  文档上传、给 Bob 的片段授权、机密片段可见性/密级覆盖、成员加入都会落 `audit_log`；
+  平台管理员 `POST /api/admin/tenants` 指定 `admin_email` 时，新租户也会记录该管理员的
+  `member.add`。初始化动作的 actor 标记为「系统初始化」。
 
 调用示例：
 
