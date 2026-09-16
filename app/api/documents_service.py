@@ -19,7 +19,8 @@ def ingest_upload(*, tconn, tenant_id: int, tenant_slug: str,
                   owner_user_id: int, filename: str, content: bytes,
                   title: str | None, visibility: str,
                   owner_team: str | None, owner_dept: str | None,
-                  classification: str = "internal") -> dict:
+                  classification: str = "internal",
+                  actor: dict | None = None) -> dict:
     ext = _ext(filename)
     if ext not in config.SUPPORTED_EXT:
         raise ValueError(f"不支持的文件类型 {ext}")
@@ -84,6 +85,19 @@ def ingest_upload(*, tconn, tenant_id: int, tenant_slug: str,
                 visibility=None,  # 默认继承文档可见性，可后续单独绑定
             )
         db_tenant.bump_index_generation(tconn)
+        if actor is not None:
+            db_tenant.append_audit(
+                tconn, tenant_id=tenant_id, actor_id=actor["user_id"],
+                actor_name=actor.get("display_name"), actor_email=actor.get("email"),
+                action="document.upload", object_type="document", object_id=document_id,
+                document_id=document_id, ip=actor.get("ip"),
+                summary=f"上传文档《{doc_title}》：{file_type}，{len(specs)} 个片段，"
+                        f"可见性 {visibility}，密级 {classification}",
+                after={"title": doc_title, "source_name": filename, "file_type": file_type,
+                       "visibility": visibility, "classification": classification,
+                       "chunk_count": len(specs), "char_count": len(full_text),
+                       "owner_team": owner_team, "owner_dept": owner_dept},
+            )
         tconn.commit()
     except Exception:
         blob_path.unlink(missing_ok=True)

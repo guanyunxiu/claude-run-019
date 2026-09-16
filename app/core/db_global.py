@@ -132,6 +132,28 @@ def add_tenant_member(conn, tenant_id: int, user_id: int, role: str = "member",
     )
 
 
+def upsert_tenant_member(conn, tenant_id: int, user_id: int, role: str = "member",
+                         team: str | None = None, department: str | None = None,
+                         clearance: str = "internal") -> tuple[bool, dict | None]:
+    """新增或更新成员，返回 (是否为新增, 改前快照)。
+
+    已存在时执行更新并返回旧值，便于调用方区分 member.add 与成员信息变更留痕。
+    """
+    old = get_membership(conn, tenant_id, user_id)
+    before = None
+    if old is not None:
+        before = {"role": old["role"], "team": old["team"],
+                  "department": old["department"], "clearance": old["clearance"]}
+    conn.execute(
+        "INSERT INTO tenant_users(tenant_id, user_id, role, team, department, clearance)"
+        " VALUES (?,?,?,?,?,?) ON CONFLICT(tenant_id, user_id) DO UPDATE SET"
+        " role=excluded.role, team=excluded.team, department=excluded.department,"
+        " clearance=excluded.clearance",
+        (tenant_id, user_id, role, team, department, clearance),
+    )
+    return old is None, before
+
+
 def update_member_clearance(conn, tenant_id: int, user_id: int, clearance: str) -> bool:
     cur = conn.execute(
         "UPDATE tenant_users SET clearance=? WHERE tenant_id=? AND user_id=?",

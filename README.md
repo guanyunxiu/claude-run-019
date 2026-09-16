@@ -152,6 +152,10 @@ python3 tests/test_api.py
   并标注 `[来源n]`；LLM 调用失败或返回为空时自动降级为抽取式，响应中
   `mode="extractive"`、`degraded=true`，前端明确提示“已配置 LLM 但调用失败，已自动降级”，
   不会误显示为“LLM 生成”。
+- **TOCTOU 复核**：问答在三处按“当前”权限实时校验，防止“检索后、返回前”被加 deny/降密
+  （慢 LLM 场景尤甚）导致本次响应泄权——①检索命中后先过滤再构造上下文；②LLM 返回后，
+  若其引用的任一片段在调用期间失效则丢弃生成答案并降级；③返回前最终复核 `sources`。
+  被 deny 的片段不会出现在答案正文或来源中。
 - 每条回答附 `sources`：**原文文档名、源文件名、章节路径、片段序号、页码、字符区间、BM25 分**；
   溯源接口 `GET /api/documents/{id}/chunks/{cid}/source` 返回片段精确原文与前后文，
   **前后文窗口按相邻片段的 ACL/密级/deny/时限逐条裁切**：窗口不得滑入相邻无权片段
@@ -181,6 +185,24 @@ python3 tests/test_api.py
 | GET/POST/DELETE `/api/documents/{id}/rules[/{rid}]` | 文档级 allow/deny 规则（整篇生效） | 所有者/管理员 |
 | POST `/api/search` | 权限穿透检索 | 登录 |
 | POST `/api/ask` | 问答 + 溯源 | 登录 |
+| GET `/api/audit` | 权限变更审计查询（`start/end/actor_id/document_id/action/limit/offset`） | 租户管理员 |
+| GET `/api/audit/export` | 审计导出 CSV（同过滤参数） | 租户管理员 |
+
+### 权限变更审计（只追加）
+
+- 租户库内置 `audit_log` 表，记录**谁（id/姓名/邮箱/IP）、在什么时间、做了什么动作、
+  作用在哪个对象（文档/片段/规则/成员）、改前改后 JSON 摘要**。
+- 覆盖动作：文档上传/删除/改密级、片段可见性/密级变更、grant 与文档规则的增删
+  （含 allow/deny/有效期）、成员加入（`member.add`）、**成员信息更新（`member.update`，
+  对已在租户用户重复 POST 时按改前/改后留痕）**、成员密级调整（成员更新中密级变化也记
+  `member.clearance_update`，与专门接口一致，不伪装成加入）、踢人。
+- **只追加护栏**：表上有 `BEFORE UPDATE/DELETE` 触发器，任何改写或抹除（含直接连库）都会被
+  SQLite `RAISE(ABORT)` 拒绝；应用层也无修改/删除接口。
+- 访问控制：仅**本租户管理员**可查/导出，普通成员调用返回 403、匿名 401；查询强制带
+  `tenant_id` 闸门，审计存于各租户独立库，**别的租户审计完全看不到**。
+- 全局库操作（成员密级/踢人/加成员）也会把审计冗余写入对应租户库，保证单租户审计完整。
+- `GET /api/audit?document_id=&actor_id=&action=&start=&end=` 返回 JSON；
+  `GET /api/audit/export?...` 返回带 BOM 的 UTF-8 CSV（Excel 可直接打开）。
 
 调用示例：
 
@@ -204,7 +226,7 @@ app/
   config.py                 # 全部配置（数据目录、分段/检索参数、LLM）
   core/
     db_global.py            # 全局库：租户/账号/成员/会话
-    db_tenant.py            # 租户库：文档/片段/片段授权/查询日志（每租户独立文件）
+    db_tenant.py            # 租户库：文档/片段/授权/文档规则/只追加审计/索引代数（独立文件）
     security.py             # PBKDF2 口令哈希、会话令牌
     permissions.py          # 可见性模型 + 可访问片段/文档 SQL 谓词
     retrieval.py            # 中文分词 + BM25（权限白名单过滤、按租户缓存）

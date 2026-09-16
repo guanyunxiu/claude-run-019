@@ -34,6 +34,17 @@ class RequestContext:
             "display_name": u.get("display_name"),
         }
 
+    @property
+    def actor(self) -> dict:
+        """写审计时的操作者信息（含来源 IP，由 handler 注入）。"""
+        u = self.user
+        return {
+            "user_id": u["user_id"],
+            "email": u.get("email"),
+            "display_name": u.get("display_name"),
+            "ip": getattr(self, "ip", None),
+        }
+
     def authenticate(self, gconn: sqlite3.Connection, auth_header: str | None) -> bool:
         if not auth_header or not auth_header.startswith("Bearer "):
             return False

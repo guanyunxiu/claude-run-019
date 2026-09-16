@@ -88,7 +88,52 @@ CREATE TABLE IF NOT EXISTS meta (
     value INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO meta(key, value) VALUES ('index_generation', 0);
+
+-- ============================ 权限变更审计（只追加） ============================
+-- 仅由应用在同事务内 INSERT；表上有触发器禁止 UPDATE/DELETE，防止事后篡改/抹除。
+-- 成员密级/踢人等全局库操作也冗余写入本租户审计表，保证一个租户的审计完整可查。
+CREATE TABLE IF NOT EXISTS audit_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at   REAL NOT NULL,                 -- unix 秒（服务端时钟）
+    actor_id     INTEGER NOT NULL,              -- 操作者用户 id
+    actor_name   TEXT,                          -- 操作者显示名（冗余，防止其后续改名/删除）
+    actor_email  TEXT,
+    action       TEXT NOT NULL,                 -- 见下方 ACTION_* 说明
+    object_type  TEXT NOT NULL,                 -- document/chunk/rule/grant/member/document_rule
+    object_id    TEXT,                          -- 对象 id（规则/片段/文档/被操作成员 id）
+    document_id  INTEGER,                       -- 关联文档（便于按文档查）
+    summary      TEXT NOT NULL,                 -- 人类可读摘要
+    before_json  TEXT,                          -- 改前快照（JSON，可空）
+    after_json   TEXT,                          -- 改后快照（JSON，可空）
+    ip           TEXT,                          -- 操作者来源 IP（可空）
+    tenant_id    INTEGER NOT NULL               -- 冗余租户闸门
+);
+CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_log(created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor_id);
+CREATE INDEX IF NOT EXISTS idx_audit_doc ON audit_log(document_id);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
+
+-- 只追加护栏：任何对审计表的 UPDATE/DELETE 都被拒绝（含应用自身 bug / 直接连库）
+CREATE TRIGGER IF NOT EXISTS trg_audit_no_update
+BEFORE UPDATE ON audit_log
+BEGIN
+    SELECT RAISE(ABORT, 'audit_log 为只追加表，禁止 UPDATE');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_audit_no_delete
+BEFORE DELETE ON audit_log
+BEGIN
+    SELECT RAISE(ABORT, 'audit_log 为只追加表，禁止 DELETE');
+END;
 """
+
+# 审计动作取值（集中定义，避免拼写漂移）
+AUDIT_ACTIONS = (
+    "document.upload", "document.delete",
+    "document.classification_update", "document_rule.add", "document_rule.delete",
+    "chunk.visibility_update", "chunk.classification_update",
+    "grant.add", "grant.delete",
+    "member.add", "member.update", "member.clearance_update", "member.remove",
+)
 
 # 增量迁移：对旧库补齐新列/新表
 _COLUMN_MIGRATIONS = {
@@ -295,3 +340,59 @@ def log_query(conn, user_id: int, question: str, hit_count: int) -> None:
         "INSERT INTO query_logs(user_id, question, hit_count, created_at) VALUES (?,?,?,?)",
         (user_id, question, hit_count, time.time()),
     )
+
+
+# ---------------- 权限变更审计（只追加） ----------------
+
+def append_audit(conn, *, tenant_id: int, actor_id: int, action: str, object_type: str,
+                 summary: str, object_id: str | int | None = None,
+                 document_id: int | None = None, before: dict | None = None,
+                 after: dict | None = None, actor_name: str | None = None,
+                 actor_email: str | None = None, ip: str | None = None) -> int:
+    """写入一条审计记录。由触发器保证不可 UPDATE/DELETE。
+
+    返回审计行 id。所有参数均做 JSON 序列化，before/after 为改前改后摘要。
+    """
+    import json as _json
+    cur = conn.execute(
+        """INSERT INTO audit_log(created_at, actor_id, actor_name, actor_email, action,
+               object_type, object_id, document_id, summary, before_json, after_json, ip, tenant_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (time.time(), actor_id, actor_name, actor_email, action, object_type,
+         None if object_id is None else str(object_id), document_id, summary,
+         _json.dumps(before, ensure_ascii=False, sort_keys=True) if before is not None else None,
+         _json.dumps(after, ensure_ascii=False, sort_keys=True) if after is not None else None,
+         ip, tenant_id),
+    )
+    return int(cur.lastrowid)
+
+
+def query_audit(conn, tenant_id: int, *, start: float | None = None,
+                end: float | None = None, actor_id: int | None = None,
+                document_id: int | None = None, action: str | None = None,
+                limit: int = 200, offset: int = 0) -> list[sqlite3.Row]:
+    """按 时间/人/文档/动作 查询审计（强制 tenant_id 闸门，永远不跨租户）。"""
+    where = ["tenant_id=?"]
+    params: list = [tenant_id]
+    if start is not None:
+        where.append("created_at >= ?")
+        params.append(start)
+    if end is not None:
+        where.append("created_at <= ?")
+        params.append(end)
+    if actor_id is not None:
+        where.append("actor_id = ?")
+        params.append(actor_id)
+    if document_id is not None:
+        where.append("document_id = ?")
+        params.append(document_id)
+    if action:
+        where.append("action = ?")
+        params.append(action)
+    limit = max(1, min(int(limit), 2000))
+    offset = max(0, int(offset))
+    return conn.execute(
+        f"""SELECT * FROM audit_log WHERE {' AND '.join(where)}
+            ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?""",
+        params + [limit, offset],
+    ).fetchall()

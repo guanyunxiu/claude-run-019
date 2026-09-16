@@ -64,15 +64,21 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "ResearchKB/1.0"
 
     # ---- 基础 IO ----
-    def _send(self, status: int, payload, *, ctype="application/json; charset=utf-8"):
+    def _send(self, status: int, payload, *, ctype="application/json; charset=utf-8",
+              extra_headers=None):
         if isinstance(payload, (dict, list)):
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         else:
             body = payload if isinstance(payload, bytes) else str(payload).encode("utf-8")
+        extra_headers = extra_headers or {}
+        # 允许调用方通过 extra_headers 覆盖 Content-Type（如 CSV 导出），避免重复头
+        ctype = extra_headers.pop("Content-Type", ctype)
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
+        for k, v in extra_headers.items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
@@ -124,10 +130,18 @@ class Handler(BaseHTTPRequestHandler):
             if auth_required:
                 if not ctx.authenticate(ctx.gconn, self.headers.get("Authorization")):
                     raise ApiError(401, "未登录或登录已过期")
+                # 审计来源 IP：优先反向代理透传的 X-Forwarded-For
+                fwd = self.headers.get("X-Forwarded-For")
+                ctx.ip = (fwd.split(",")[0].strip() if fwd else
+                          (self.client_ip if hasattr(self, "client_ip") else
+                           self.client_address[0]))
             ctx.gconn.commit()
             result = handler_fn(self, ctx, **kwargs)
             ctx.commit()
-            if result is not None:
+            if isinstance(result, tuple):
+                payload, status, extra_headers = result
+                self._send(status, payload, extra_headers=extra_headers)
+            elif result is not None:
                 self._send(200, result)
         except ApiError as e:
             ctx.gconn.rollback()
@@ -307,13 +321,44 @@ def add_member(h, ctx):
     user = db_global.get_user_by_email(ctx.gconn, email)
     if user is None:
         raise ApiError(404, "用户不存在，请先让其注册")
-    db_global.add_tenant_member(
+    new_team = data.get("team") or None
+    new_dept = data.get("department") or None
+    is_new, before = db_global.upsert_tenant_member(
         ctx.gconn, ctx.user["tenant_id"], user["id"], role,
-        data.get("team") or None, data.get("department") or None, clearance,
+        new_team, new_dept, clearance,
     )
-    return {"message": f"已将 {email} 加入租户", "role": role,
-            "team": data.get("team"), "department": data.get("department"),
-            "clearance": clearance}
+    after = {"user_id": user["id"], "email": email, "role": role,
+             "team": new_team, "department": new_dept, "clearance": clearance}
+
+    if is_new:
+        _audit(ctx, action="member.add", object_type="member", object_id=user["id"],
+               summary=f"成员 {user['display_name']}（{email}）加入租户，角色 {role}，密级 {clearance}",
+               after=after)
+        message = f"已将 {email} 加入租户"
+    else:
+        # 已在租户内：这是一次“更新”，必须留改前/改后；密级变化走与专门接口一致的动作
+        changes = []
+        if before["clearance"] != clearance:
+            changes.append(f"密级 {before['clearance']}→{clearance}")
+            _audit(ctx, action="member.clearance_update", object_type="member",
+                   object_id=user["id"],
+                   summary=f"经成员接口调整 {user['display_name']} 密级："
+                           f"{before['clearance']} → {clearance}",
+                   before={"clearance": before["clearance"]},
+                   after={"clearance": clearance})
+        if before["role"] != role:
+            changes.append(f"角色 {before['role']}→{role}")
+        if before["team"] != new_team:
+            changes.append(f"团队 {before['team']}→{new_team}")
+        if before["department"] != new_dept:
+            changes.append(f"部门 {before['department']}→{new_dept}")
+        change_desc = "，".join(changes) if changes else "无实质字段变化"
+        _audit(ctx, action="member.update", object_type="member", object_id=user["id"],
+               summary=f"更新成员 {user['display_name']}（{email}）：{change_desc}",
+               before=before, after=after)
+        message = f"已更新成员 {email}：{change_desc}"
+    return {"message": message, "is_new": is_new, "role": role,
+            "team": new_team, "department": new_dept, "clearance": clearance}
 
 
 @Handler.route("PUT", "/api/admin/members/{user_id}/clearance")
@@ -326,7 +371,15 @@ def set_member_clearance(h, ctx, user_id):
     clearance = data.get("clearance")
     if clearance not in permissions.CLASSIFICATIONS:
         raise ApiError(400, f"clearance 必须是 {permissions.CLASSIFICATIONS}")
+    before_row = db_global.get_membership(ctx.gconn, ctx.user["tenant_id"], target_id)
+    if before_row is None:
+        raise ApiError(404, "该用户不是当前租户成员")
+    target = db_global.get_user(ctx.gconn, target_id)
     ok = db_global.update_member_clearance(ctx.gconn, ctx.user["tenant_id"], target_id, clearance)
+    _audit(ctx, action="member.clearance_update", object_type="member", object_id=target_id,
+           summary=f"调整成员 {target['display_name']} 密级：{before_row['clearance']} → {clearance}",
+           before={"clearance": before_row["clearance"]},
+           after={"clearance": clearance})
     if not ok:
         raise ApiError(404, "该用户不是当前租户成员")
     return {"message": f"密级许可已更新为 {clearance}", "clearance": clearance}
@@ -340,6 +393,17 @@ def remove_member(h, ctx, user_id):
     target_id = _parse_id(user_id, "user_id")
     if target_id == ctx.user["user_id"]:
         raise ApiError(400, "不能移除当前登录的自己")
+    before_row = db_global.get_membership(ctx.gconn, ctx.user["tenant_id"], target_id)
+    if before_row is None:
+        raise ApiError(404, "该用户不是当前租户成员")
+    target = db_global.get_user(ctx.gconn, target_id)
+    # 先落审计（与成员删除在同一逻辑变更中），再移除并吊销会话
+    _audit(ctx, action="member.remove", object_type="member", object_id=target_id,
+           summary=f"移出租户并吊销其全部会话：{target['display_name']}（{target['email']}）",
+           before={"user_id": target_id, "email": target["email"],
+                   "role": before_row["role"], "team": before_row["team"],
+                   "department": before_row["department"],
+                   "clearance": before_row["clearance"]})
     removed = db_global.remove_tenant_member(ctx.gconn, ctx.user["tenant_id"], target_id)
     if not removed:
         raise ApiError(404, "该用户不是当前租户成员")
@@ -373,6 +437,7 @@ def upload_document(h, ctx):
             owner_team=(fields.get("owner_team") or "").strip() or ctx.user.get("team"),
             owner_dept=(fields.get("owner_dept") or "").strip() or ctx.user.get("department"),
             classification=classification,
+            actor=ctx.actor,
         )
     except ValueError as e:
         # 入库参数/解析类错误属于客户端问题，返回 400 而非 500
@@ -400,6 +465,16 @@ def list_documents(h, ctx):
                                         "classification": None}))
         result.append(item)
     return result
+
+
+def _audit(ctx, **kw):
+    """向当前租户审计表追加一条记录（操作者/IP 自动带入）。"""
+    a = ctx.actor
+    return db_tenant.append_audit(
+        ctx.tconn, tenant_id=ctx.user["tenant_id"],
+        actor_id=a["user_id"], actor_name=a.get("display_name"),
+        actor_email=a.get("email"), ip=a.get("ip"), **kw,
+    )
 
 
 def _load_managed_doc(ctx, doc_id) -> dict:
@@ -442,6 +517,13 @@ def get_document(h, ctx, doc_id):
 @Handler.route("DELETE", "/api/documents/{doc_id}")
 def delete_document(h, ctx, doc_id):
     doc = _load_managed_doc(ctx, _parse_id(doc_id, "document_id"))
+    before = {"title": doc["title"], "source_name": doc["source_name"],
+              "visibility": doc["visibility"], "classification": doc["classification"],
+              "char_count": doc["char_count"], "owner_user_id": doc["owner_user_id"]}
+    # 审计须在删除前写入同一事务
+    _audit(ctx, action="document.delete", object_type="document",
+           object_id=doc["id"], document_id=doc["id"],
+           summary=f"删除文档《{doc['title']}》（{doc['source_name']}）", before=before)
     blob_rel = db_tenant.delete_document(ctx.tconn, doc["id"], ctx.user["tenant_id"])
     ctx.tconn.commit()
     if blob_rel:
@@ -592,7 +674,12 @@ def set_chunk_visibility(h, ctx, chunk_id):
     vis = data.get("visibility")
     if vis is not None and vis not in permissions.VALID_VIS:
         raise ApiError(400, f"visibility 必须是 {permissions.VALID_VIS} 或 null(继承)")
+    before = {"visibility": row["visibility"], "heading_path": row["heading_path"]}
     db_tenant.set_chunk_visibility(ctx.tconn, row["id"], vis)
+    _audit(ctx, action="chunk.visibility_update", object_type="chunk",
+           object_id=row["id"], document_id=row["document_id"],
+           summary=f"修改片段#{row['chunk_index']+1}可见性：{row['visibility'] or '继承'} → {vis or '继承'}",
+           before=before, after={"visibility": vis})
     db_tenant.bump_document_version(ctx.tconn, row["document_id"])
     return {"chunk_id": row["id"], "visibility": vis,
             "message": "片段可见性已更新" + ("（继承文档）" if vis is None else "")}
@@ -606,7 +693,12 @@ def set_chunk_classification(h, ctx, chunk_id):
     cls = data.get("classification")
     if cls is not None and cls not in permissions.CLASSIFICATIONS:
         raise ApiError(400, f"classification 必须是 {permissions.CLASSIFICATIONS} 或 null(继承)")
+    before = {"classification": row["classification"], "heading_path": row["heading_path"]}
     db_tenant.set_chunk_classification(ctx.tconn, row["id"], cls)
+    _audit(ctx, action="chunk.classification_update", object_type="chunk",
+           object_id=row["id"], document_id=row["document_id"],
+           summary=f"修改片段#{row['chunk_index']+1}密级：{row['classification'] or '继承'} → {cls or '继承'}",
+           before=before, after={"classification": cls})
     db_tenant.bump_document_version(ctx.tconn, row["document_id"])
     return {"chunk_id": row["id"], "classification": cls,
             "message": "片段密级已更新" + ("（继承文档）" if cls is None else f"（{cls}）")}
@@ -650,6 +742,13 @@ def add_chunk_grant(h, ctx, chunk_id):
         raise ApiError(400, f"effect 必须是 {permissions.VALID_EFFECTS}")
     expires_at = _resolve_expires(data)
     gid = db_tenant.add_grant(ctx.tconn, row["id"], stype, svalue, effect, expires_at)
+    word = "拒绝规则" if effect == "deny" else "授权"
+    ttl = f"，到期 {expires_at:.0f}" if expires_at else "，长期有效"
+    _audit(ctx, action="grant.add", object_type="grant", object_id=gid,
+           document_id=row["document_id"],
+           summary=f"为片段#{row['chunk_index']+1} 添加{word}：{stype}={svalue}{ttl}",
+           after={"grant_id": gid, "chunk_id": row["id"], "subject_type": stype,
+                  "subject_value": svalue, "effect": effect, "expires_at": expires_at})
     db_tenant.bump_document_version(ctx.tconn, row["document_id"])
     return {"grant_id": gid, "chunk_id": row["id"],
             "subject_type": stype, "subject_value": svalue,
@@ -659,11 +758,20 @@ def add_chunk_grant(h, ctx, chunk_id):
 @Handler.route("DELETE", "/api/chunks/{chunk_id}/grants/{grant_id}")
 def remove_chunk_grant(h, ctx, chunk_id, grant_id):
     row = _load_managed_chunk(ctx, chunk_id)
-    ok = db_tenant.delete_grant(
-        ctx.tconn, _parse_id(grant_id, "grant_id"), row["id"]
-    )
+    gid = _parse_id(grant_id, "grant_id")
+    existing = ctx.tconn.execute(
+        "SELECT * FROM chunk_grants WHERE id=? AND chunk_id=?", (gid, row["id"])
+    ).fetchone()
+    ok = db_tenant.delete_grant(ctx.tconn, gid, row["id"])
     if not ok:
         raise ApiError(404, "授权记录不存在")
+    _audit(ctx, action="grant.delete", object_type="grant", object_id=gid,
+           document_id=row["document_id"],
+           summary=f"移除片段#{row['chunk_index']+1}规则："
+                   f"{existing['effect']}:{existing['subject_type']}={existing['subject_value']}",
+           before={"subject_type": existing["subject_type"],
+                   "subject_value": existing["subject_value"], "effect": existing["effect"],
+                   "expires_at": existing["expires_at"]})
     db_tenant.bump_document_version(ctx.tconn, row["document_id"])
     return {"message": "规则已移除"}
 
@@ -677,7 +785,12 @@ def set_document_classification(h, ctx, doc_id):
     cls = data.get("classification")
     if cls not in permissions.CLASSIFICATIONS:
         raise ApiError(400, f"classification 必须是 {permissions.CLASSIFICATIONS}")
+    before = {"classification": doc["classification"]}
     db_tenant.set_document_classification(ctx.tconn, doc["id"], cls)
+    _audit(ctx, action="document.classification_update", object_type="document",
+           object_id=doc["id"], document_id=doc["id"],
+           summary=f"修改文档《{doc['title']}》密级：{doc['classification']} → {cls}",
+           before=before, after={"classification": cls})
     db_tenant.bump_document_version(ctx.tconn, doc["id"])
     return {"document_id": doc["id"], "classification": cls}
 
@@ -708,6 +821,13 @@ def add_document_rule(h, ctx, doc_id):
         svalue = str(int(svalue))
     expires_at = _resolve_expires(data)
     rid = db_tenant.add_document_rule(ctx.tconn, doc["id"], stype, svalue, effect, expires_at)
+    word = "拒绝" if effect == "deny" else "授权"
+    ttl = f"，到期 {expires_at:.0f}" if expires_at else "，长期有效"
+    _audit(ctx, action="document_rule.add", object_type="document_rule", object_id=rid,
+           document_id=doc["id"],
+           summary=f"对文档《{doc['title']}》添加{word}规则：{stype}={svalue}{ttl}",
+           after={"rule_id": rid, "subject_type": stype, "subject_value": svalue,
+                  "effect": effect, "expires_at": expires_at})
     db_tenant.bump_document_version(ctx.tconn, doc["id"])
     return {"rule_id": rid, "document_id": doc["id"],
             "subject_type": stype, "subject_value": svalue,
@@ -717,16 +837,115 @@ def add_document_rule(h, ctx, doc_id):
 @Handler.route("DELETE", "/api/documents/{doc_id}/rules/{rule_id}")
 def remove_document_rule(h, ctx, doc_id, rule_id):
     doc = _load_managed_doc(ctx, _parse_id(doc_id, "document_id"))
-    ok = db_tenant.delete_document_rule(
-        ctx.tconn, _parse_id(rule_id, "rule_id"), doc["id"]
-    )
+    rid = _parse_id(rule_id, "rule_id")
+    existing = ctx.tconn.execute(
+        "SELECT * FROM document_rules WHERE id=? AND document_id=?", (rid, doc["id"])
+    ).fetchone()
+    ok = db_tenant.delete_document_rule(ctx.tconn, rid, doc["id"])
     if not ok:
         raise ApiError(404, "规则不存在")
+    _audit(ctx, action="document_rule.delete", object_type="document_rule", object_id=rid,
+           document_id=doc["id"],
+           summary=f"移除文档《{doc['title']}》规则："
+                   f"{existing['effect']}:{existing['subject_type']}={existing['subject_value']}",
+           before={"subject_type": existing["subject_type"],
+                   "subject_value": existing["subject_value"], "effect": existing["effect"],
+                   "expires_at": existing["expires_at"]})
     db_tenant.bump_document_version(ctx.tconn, doc["id"])
     return {"message": "文档规则已移除"}
 
 
 # ============================== 检索 / 问答 ==============================
+
+def _require_tenant_admin(ctx):
+    if ctx.user.get("tenant_role") != "admin":
+        raise ApiError(403, "仅租户管理员可查看审计")
+
+
+def _audit_filters(query: dict):
+    import time as _time
+    filters = {}
+    try:
+        filters["start"] = float(query["start"]) if query.get("start") else None
+        filters["end"] = float(query["end"]) if query.get("end") else None
+        filters["actor_id"] = int(query["actor_id"]) if query.get("actor_id") else None
+        filters["document_id"] = int(query["document_id"]) if query.get("document_id") else None
+        filters["limit"] = min(int(query.get("limit") or 200), 2000)
+        filters["offset"] = max(int(query.get("offset") or 0), 0)
+    except (TypeError, ValueError):
+        raise ApiError(400, "审计过滤参数非法")
+    filters["action"] = (query.get("action") or "").strip() or None
+    return filters
+
+
+@Handler.route("GET", "/api/audit")
+def get_audit(h, ctx):
+    """查询当前租户审计（按时间倒序）。普通成员 403；查询强制 tenant_id 闸门。"""
+    _require_tenant_admin(ctx)
+    from urllib.parse import parse_qs
+    q = {k: v[0] for k, v in parse_qs(urlparse(h.path).query).items()}
+    f = _audit_filters(q)
+    rows = db_tenant.query_audit(
+        ctx.tconn, ctx.user["tenant_id"], start=f["start"], end=f["end"],
+        actor_id=f["actor_id"], document_id=f["document_id"], action=f["action"],
+        limit=f["limit"], offset=f["offset"],
+    )
+    return {"count": len(rows), "results": [_audit_row(r) for r in rows]}
+
+
+@Handler.route("GET", "/api/audit/export")
+def export_audit(h, ctx):
+    """导出当前租户审计为 CSV（同样仅管理员、同样租户闸门）。"""
+    import csv
+    import io
+    _require_tenant_admin(ctx)
+    from urllib.parse import parse_qs
+    q = {k: v[0] for k, v in parse_qs(urlparse(h.path).query).items()}
+    f = _audit_filters(q)
+    # 导出上限更高，但仍封顶，防止一次拉取全库
+    f["limit"] = min(f.get("limit", 2000) if f.get("limit") else 2000, 10000)
+    rows = db_tenant.query_audit(
+        ctx.tconn, ctx.user["tenant_id"], start=f["start"], end=f["end"],
+        actor_id=f["actor_id"], document_id=f["document_id"], action=f["action"],
+        limit=f["limit"], offset=f["offset"],
+    )
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["id", "created_at", "actor_id", "actor_name", "actor_email",
+                     "action", "object_type", "object_id", "document_id",
+                     "summary", "before_json", "after_json", "ip"])
+    for r in rows:
+        writer.writerow([r["id"], r["created_at"], r["actor_id"], r["actor_name"],
+                         r["actor_email"], r["action"], r["object_type"], r["object_id"],
+                         r["document_id"], r["summary"], r["before_json"],
+                         r["after_json"], r["ip"]])
+    csv_bytes = ("﻿" + buf.getvalue()).encode("utf-8")
+    import time as _time
+    fname = f"audit_{ctx.tenant_slug}_{int(_time.time())}.csv"
+    return (csv_bytes, 200, {
+        "Content-Type": "text/csv; charset=utf-8",
+        "Content-Disposition": f'attachment; filename="{fname}"',
+    })
+
+
+def _audit_row(r):
+    import json as _json
+    def _load(s):
+        if not s:
+            return None
+        try:
+            return _json.loads(s)
+        except ValueError:
+            return s
+    return {
+        "id": r["id"], "created_at": r["created_at"], "actor_id": r["actor_id"],
+        "actor_name": r["actor_name"], "actor_email": r["actor_email"],
+        "action": r["action"], "object_type": r["object_type"],
+        "object_id": r["object_id"], "document_id": r["document_id"],
+        "summary": r["summary"], "before": _load(r["before_json"]),
+        "after": _load(r["after_json"]), "ip": r["ip"],
+    }
+
 
 @Handler.route("POST", "/api/search")
 def search(h, ctx):

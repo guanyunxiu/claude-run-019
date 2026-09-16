@@ -227,7 +227,27 @@ def visible_document_stats(conn, ctx: dict, document_ids: list[int] | None = Non
     }
 
 
-# ---------------- 管理权限（仅限本租户管理员/文档所有者，不随密级/deny 变化） ----------------
+# ---------------- 管理权限（仅限租户管理员/文档所有者，不随密级/deny 变化） ----------------
+
+def filter_accessible_chunk_ids(conn, ctx: dict, chunk_ids,
+                                now: float | None = None) -> set[int]:
+    """从给定片段 id 集合中，返回“此刻”仍可访问的子集。
+
+    用于问答 TOCTOU 复核：检索拿到片段后、构造答案/来源前以及返回前，
+    都用本函数按当前 ACL/密级/deny/时限重新校验，防止“检索后被加 deny”泄露。
+    """
+    ids = [int(i) for i in chunk_ids if i is not None]
+    if not ids:
+        return set()
+    where, params = accessible_chunks_where(ctx, now)
+    placeholders = ",".join("?" * len(ids))
+    rows = conn.execute(
+        f"""SELECT c.id FROM chunks c JOIN documents d ON d.id=c.document_id
+            WHERE c.id IN ({placeholders}) AND {where}""",
+        ids + params,
+    ).fetchall()
+    return {r[0] for r in rows}
+
 
 def user_can_manage(ctx: dict) -> bool:
     return (ctx.get("tenant_role") or "") == "admin"

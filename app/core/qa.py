@@ -15,6 +15,7 @@ import json
 import re
 
 from .. import config
+from . import permissions
 from .retrieval import search_index, tokenize
 
 
@@ -138,28 +139,56 @@ def _llm_answer(query: str, hits: list[dict]) -> str | None:
 
 def answer_question(tenant_slug: str, conn, ctx: dict, question: str,
                     top_k: int | None = None) -> dict:
-    hits = search_index.search(tenant_slug, conn, ctx, question, top_k=top_k)
-    used_hits = hits
-    llm_configured = bool(hits and config.LLM_BASE_URL and config.LLM_API_KEY)
+    # 第一次实时过滤：检索命中后立即按“当前”权限复核（检索与本调用之间可能已被 deny）
+    raw_hits = search_index.search(tenant_slug, conn, ctx, question, top_k=top_k)
+    hits = [h for h in raw_hits
+            if h["chunk_id"] in permissions.filter_accessible_chunk_ids(
+                conn, ctx, [h["chunk_id"] for h in raw_hits])]
+
     answer = None
+    used_hits = hits
     used_llm = False
+    llm_configured = bool(hits and config.LLM_BASE_URL and config.LLM_API_KEY)
+
     if llm_configured:
         llm_text = _llm_answer(question, hits)
-        # 仅当 LLM 真正返回非空答案时才算 llm；调用失败/为空都走抽取式降级
         if llm_text and llm_text.strip():
-            answer = llm_text.strip()
-            used_llm = True
+            # 第二次实时复核：LLM 较慢，返回期间片段可能已被 deny/降密/过期。
+            # 若喂给模型的任一来源已不可访问，则本次生成结果不可信，丢弃并降级为抽取式。
+            allowed_now = permissions.filter_accessible_chunk_ids(
+                conn, ctx, [h["chunk_id"] for h in hits])
+            still_ok = [h for h in hits if h["chunk_id"] in allowed_now]
+            if len(still_ok) == len(hits):
+                answer = llm_text.strip()
+                used_llm = True
+                used_hits = still_ok
+            else:
+                # 有权限变化：只用仍可访问的片段重做抽取式答案，避免泄露已 deny 内容
+                hits = still_ok
+
     if answer is None:
         if hits:
             answer, used_hits = _extractive_answer(question, hits)
         else:
             answer = "根据您当前可访问的知识库内容，未检索到与问题相关的文档片段。"
+            used_hits = []
+
+    # 返回前最终复核：抽取式也可能在执行间隙被 deny；来源只保留此刻仍可访问的片段
+    final_candidates = used_hits if used_hits else hits
+    final_allowed = permissions.filter_accessible_chunk_ids(
+        conn, ctx, [h["chunk_id"] for h in final_candidates])
+    final_hits = [h for h in final_candidates if h["chunk_id"] in final_allowed]
+
+    # 若答案引用的句子来自已失效片段，无法逐句裁剪时，整体退化为“无相关信息”
+    if not used_llm and not final_hits and raw_hits:
+        answer = "根据您当前可访问的知识库内容，未检索到与问题相关的文档片段。"
+
     return {
         "question": question,
         "answer": answer,
         # 配置了 LLM 但实际降级时，明确标注为 extractive（前端不再误显示“LLM 生成”）
         "mode": "llm" if used_llm else "extractive",
-        "llm_configured": llm_configured,
-        "degraded": llm_configured and not used_llm,
-        "sources": _sources(used_hits if used_hits else hits),
+        "llm_configured": bool(raw_hits and config.LLM_BASE_URL and config.LLM_API_KEY),
+        "degraded": bool(raw_hits and config.LLM_BASE_URL and config.LLM_API_KEY) and not used_llm,
+        "sources": _sources(final_hits),
     }
